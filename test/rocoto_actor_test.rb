@@ -39,6 +39,20 @@ class RocotoActorTest < Minitest::Test
     assert_match(/invalid actor configuration/, error.message)
   end
 
+  def test_spawn_rejects_an_unloadable_source
+    error = assert_raises(RocotoActor::RemoteError) do
+      RocotoActor.spawn(ExampleActor, source: File.join(Dir.tmpdir, "missing-rocoto-actor.rb"))
+    end
+
+    assert_equal "LoadError", error.remote_class
+  end
+
+  def test_spawn_rejects_unsupported_constructor_arguments
+    assert_raises(RocotoActor::SerializationError) do
+      RocotoActor.spawn(ExampleActor, Object.new)
+    end
+  end
+
   def test_remote_errors_are_returned_without_stopping_actor
     error = assert_raises(RocotoActor::RemoteError) do
       @actor.ask(:fail).value(timeout: 1)
@@ -130,6 +144,27 @@ class RocotoActorTest < Minitest::Test
 
     assert @actor.stop
     assert_raises(RocotoActor::ActorStoppedError) { @actor.ask("too late") }
+  end
+
+  def test_concurrent_stop_waits_for_existing_shutdown
+    @actor.ask(:hang)
+    first_stop = Thread.new { @actor.stop(timeout: 0.2) }
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
+    until @actor.instance_variable_get(:@stopped)
+      raise "stop did not start" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      Thread.pass
+    end
+
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    second_result = @actor.stop(timeout: 1)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+    assert second_result
+    assert_operator elapsed, :>, 0.05
+    first_stop.value
+  ensure
+    first_stop&.join
   end
 
   def test_graceful_stop_drains_pending_messages

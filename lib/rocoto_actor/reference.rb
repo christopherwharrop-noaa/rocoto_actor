@@ -62,7 +62,7 @@ module RocotoActor
       end
 
       shutdown = @pending_mutex.synchronize do
-        return @process_exited if @stopped
+        next if @stopped
 
         @stopped = true
         @next_id += 1
@@ -76,6 +76,8 @@ module RocotoActor
         @outbox_condition.signal
         future
       end
+      return wait_for_exit(deadline) unless shutdown
+
       remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
       raise AskTimeoutError if remaining <= 0
 

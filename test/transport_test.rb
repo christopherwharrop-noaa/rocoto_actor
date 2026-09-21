@@ -66,4 +66,27 @@ class TransportTest < Minitest::Test
     reader&.close
     writer&.close
   end
+
+  def test_read_with_timeout_returns_nil_at_frame_boundary_eof
+    reader, writer = UNIXSocket.pair
+    writer.close
+
+    assert_nil RocotoActor::Transport.read(reader, timeout: 0.05)
+  ensure
+    reader&.close
+    writer&.close
+  end
+
+  def test_read_with_timeout_rejects_partial_frame_at_eof
+    reader, writer = UNIXSocket.pair
+    writer.write([4].pack("N") << "x")
+    writer.close
+
+    assert_raises(EOFError) do
+      RocotoActor::Transport.read(reader, timeout: 0.05)
+    end
+  ensure
+    reader&.close
+    writer&.close
+  end
 end
