@@ -5,9 +5,11 @@ require "rbconfig"
 
 require_relative "rocoto_actor/version"
 require_relative "rocoto_actor/errors"
+require_relative "rocoto_actor/handle"
 require_relative "rocoto_actor/transport"
 require_relative "rocoto_actor/future"
 require_relative "rocoto_actor/reference"
+require_relative "rocoto_actor/broker"
 
 module RocotoActor
   PARENT_CHECK_INTERVAL = 0.1

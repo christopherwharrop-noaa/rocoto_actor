@@ -51,6 +51,7 @@ module RocotoActor
       size = header.unpack1("N")
       raise Error, "invalid frame size: #{size}" if size > MAX_FRAME_SIZE
 
+      Thread.current[:rocoto_actor_transport_socket] = io
       decode(JSON.parse(read_exactly(io, size, deadline: deadline)))
     rescue JSON::JSONError => error
       raise SerializationError, error.message
@@ -69,6 +70,7 @@ module RocotoActor
 
         ["float", value]
       when Symbol then ["symbol", value.to_s]
+      when ActorHandle then ["actor_handle", value.id]
       when Array
         encode_container(value, seen) do
           ["array", value.map { |item| encode(item, seen, depth + 1) }]
@@ -102,6 +104,8 @@ module RocotoActor
       when "boolean", "string", "float" then payload
       when "integer" then Integer(payload, 10)
       when "symbol" then payload.to_sym
+      when "actor_handle"
+        ActorHandle.new(payload, socket: Thread.current[:rocoto_actor_transport_socket])
       when "array" then payload.map { |item| decode(item) }
       when "hash"
         payload.to_h { |key, item| [decode(key), decode(item)] }

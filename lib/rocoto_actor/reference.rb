@@ -18,6 +18,7 @@ module RocotoActor
       @pending = {}
       @pending_mutex = Mutex.new
       @outbox = []
+      @control_outbox = []
       @outbox_bytes = 0
       @writing_bytes = 0
       @outbox_condition = ConditionVariable.new
@@ -29,11 +30,38 @@ module RocotoActor
       @exit_condition = ConditionVariable.new
       @reaper = nil
       @reaper_mutex = Mutex.new
+      @broker = nil
       start_reaper
       @reader = Thread.new { read_replies }
       @reader.name = "rocoto-actor-reader-#{pid}" if @reader.respond_to?(:name=)
       @writer = Thread.new { write_requests }
       @writer.name = "rocoto-actor-writer-#{pid}" if @writer.respond_to?(:name=)
+    end
+
+    def attach_broker(broker)
+      @pending_mutex.synchronize { @broker = broker }
+    end
+
+    def send_broker_response(request_id, result: nil, error: nil, error_class: nil, message: nil, backtrace: nil)
+      response = if error
+                   {
+                     op: :broker_response,
+                     request_id: request_id,
+                     ok: false,
+                     error_class: error_class || error.class.name,
+                     message: message || error.message,
+                     backtrace: backtrace || error.backtrace || []
+                   }
+                 else
+                   { op: :broker_response, request_id: request_id, ok: true, result: result }
+                 end
+      payload = Transport.dump(response)
+      @pending_mutex.synchronize do
+        return if @writer_stopped
+
+        @control_outbox << payload
+        @outbox_condition.signal
+      end
     end
 
     def ask(message)
@@ -130,9 +158,11 @@ module RocotoActor
     def write_requests
       loop do
         payload, stop_writer = @pending_mutex.synchronize do
-          @outbox_condition.wait(@pending_mutex) while @outbox.empty? && !@writer_stopped
+          @outbox_condition.wait(@pending_mutex) while @outbox.empty? && @control_outbox.empty? && !@writer_stopped
           if @writer_stopped
             [nil, true]
+          elsif !@control_outbox.empty?
+            [@control_outbox.shift, false]
           else
             next_payload = @outbox.shift
             @outbox_bytes -= next_payload.bytesize
@@ -155,6 +185,16 @@ module RocotoActor
 
     def read_replies
       while (reply = Transport.read(@socket))
+        if reply[:op] == :broker_request
+          broker = @pending_mutex.synchronize { @broker }
+          if broker
+            broker.route(self, reply)
+          else
+            send_broker_response(reply[:request_id], error: Error.new("actor broker is unavailable"))
+          end
+          next
+        end
+
         future = remove_pending(reply.fetch(:id))
         next unless future
 
@@ -234,6 +274,7 @@ module RocotoActor
         @stopped = true
         @termination_started = true
         @writer_stopped = true
+        @control_outbox.clear
         @outbox.clear
         @outbox_bytes = 0
         @outbox_condition.broadcast

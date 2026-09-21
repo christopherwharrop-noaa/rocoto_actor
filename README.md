@@ -75,6 +75,21 @@ Only the actor's Unix socket is passed into the new process, avoiding inherited 
 
 Each actor has a small supervisor that remains a normal child of the application and owns a dedicated process group containing the actor worker. The supervisor detects worker or application death and terminates the group, including subprocesses launched by the actor. Actors are not daemonized and do not call `setsid`. A subprocess that deliberately creates another session or process group escapes this containment.
 
+## Shared actors
+
+`RocotoActor::ActorBroker` provides opaque actor handles for shared services. The broker keeps each real actor reference, socket, and lifecycle thread in the application process; only the handle ID crosses an actor boundary.
+
+```ruby
+broker = RocotoActor::ActorBroker.new
+database = broker.spawn(DatabaseActor, "app.db")
+worker = broker.spawn(WorkerActor, database)
+
+result = worker.ask(:write).value(timeout: 5)
+broker.stop
+```
+
+An actor can call a shared handle with `handle.call(message, timeout:)`. Calls are routed through the broker and do not transfer socket descriptors between actors. Brokered handles are stable logical identities, but brokered calls are at-most-once and an actor failure can leave the operation outcome ambiguous. Do not retry non-idempotent operations without an application-level request ID and deduplication policy.
+
 If the application exits, the supervisor detects it within 100 milliseconds and terminates the actor group independently of the worker's state. A process blocked in uninterruptible kernel sleep remains until the kernel operation returns, but the application does not wait for it.
 
 ## Security boundary

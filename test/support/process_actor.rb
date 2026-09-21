@@ -48,3 +48,17 @@ class BackgroundActor
     :started
   end
 end
+
+class ForwardingActor
+  def initialize(target)
+    @target = target
+  end
+
+  def receive(message)
+    if message.is_a?(Hash) && message[:timeout]
+      @target.call(message[:message], timeout: message[:timeout])
+    else
+      @target.call(message, timeout: 1)
+    end
+  end
+end
