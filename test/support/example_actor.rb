@@ -13,6 +13,8 @@ class ExampleActor
     when :hang then sleep 10
     when :crash then exit! 3
     when :pid then Process.pid
+    when :not_implemented then raise NotImplementedError, "unsupported message"
+    when :exit_gracefully then exit 4
     when :slow
       sleep 0.05
       "#{@prefix}: slow"

@@ -28,7 +28,7 @@ module RocotoActor
     # spawn children from initialize; a failed boot unregisters it. spec holds
     # what is needed to relaunch the actor; restarts records recent restart times.
     Node = Struct.new(:id, :name, :path, :generation, :parent_id, :children, :state, :reference, :booting,
-                      :spec, :policy, :restarts, :failure, :exit) do
+                      :spec, :policy, :restarts, :failure, :exit, :boot_exit) do
       def terminal?
         TERMINAL_STATES.include?(state)
       end
@@ -118,7 +118,7 @@ module RocotoActor
         @lifecycle_condition.broadcast
         queued = @lifecycle_queue
         @lifecycle_queue = []
-        [@nodes.values.select { |node| node.parent_id.nil? }, [@service, *@lifecycle_workers].compact, queued]
+        [@nodes.values, [@service, *@lifecycle_workers].compact, queued]
       end
       abandoned.each do |job|
         next unless job.is_a?(Array)
@@ -132,13 +132,11 @@ module RocotoActor
     end
 
     def ask(id, message)
-      node = @mutex.synchronize { checked_node(id) }
-      node.reference.ask(message)
+      @mutex.synchronize { checked_node(id).reference }.ask(message)
     end
 
     def tell(id, message)
-      node = @mutex.synchronize { checked_node(id) }
-      node.reference.tell(message)
+      @mutex.synchronize { checked_node(id).reference }.tell(message)
     end
 
     # RemoteError for the most recent unhandled exception in a told message
@@ -146,7 +144,7 @@ module RocotoActor
     def last_failure(id)
       @mutex.synchronize do
         node = fetch_node(id)
-        node.failure || node.reference.exit_error
+        node.reference&.exit_error || node.failure
       end
     end
 
@@ -155,7 +153,7 @@ module RocotoActor
     def last_exit(id)
       @mutex.synchronize do
         node = fetch_node(id)
-        node.exit || node.reference.exit_status
+        node.reference&.exit_status || node.exit
       end
     end
 
@@ -167,8 +165,8 @@ module RocotoActor
     end
 
     def alive?(id)
-      node = @mutex.synchronize { fetch_node(id) }
-      !node.terminal? && node.reference.alive?
+      node, reference = @mutex.synchronize { fetch_node(id).then { |found| [found, found.reference] } }
+      !node.terminal? && !reference.nil? && reference.alive?
     end
 
     def state(id)
@@ -184,7 +182,10 @@ module RocotoActor
     end
 
     def parent(id)
-      parent_id = @mutex.synchronize { fetch_node(id).parent_id }
+      parent_id = @mutex.synchronize do
+        node = fetch_node(id)
+        node.parent_id if node.parent_id && @nodes.key?(node.parent_id)
+      end
       parent_id && ActorHandle.new(parent_id, broker: self)
     end
 
@@ -309,32 +310,34 @@ module RocotoActor
     # unregisters the node, and stops any children it spawned while booting.
     # Returns the error to raise or send.
     def settle_boot(node, error)
-      children = @mutex.synchronize do
-        next [] unless node.booting
+      children, exited, reference = @mutex.synchronize do
+        next [[], false, nil] unless node.booting
 
         node.booting = false
         if error
-          node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
+          [node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, node.reference]
         else
           node.state = :running if node.state == :starting
-          []
+          [[], node.boot_exit.equal?(node.reference), nil]
         end
       end
+      # The process died after replying ready but before we settled: the actor
+      # is registered and running from the caller's view, so treat it as a crash.
+      actor_failed(node) if exited
       return nil unless error
 
-      node.reference.stop(force: true, timeout: 0)
+      reference&.stop(force: true, timeout: 0)
       unregister(node)
       enqueue_task { stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) } unless children.empty?
-      Launcher.startup_error(node.reference, error)
+      Launcher.startup_error(reference, error)
     end
 
     # Removes a node that never finished booting; its id is known only to the
     # dead process, so no handle can refer to it.
     def unregister(node)
       @mutex.synchronize do
-        node.state = :failed
+        retire(node, :failed)
         @nodes.delete(node.id)
-        @node_ids_by_reference.delete(node.reference)
         @nodes[node.parent_id]&.children&.delete(node.id)
       end
     end
@@ -479,7 +482,7 @@ module RocotoActor
       while (parent_id = node.parent_id)
         return true if parent_id == ancestor_id
 
-        node = @nodes[parent_id]
+        node = @nodes[parent_id] or return false
       end
       false
     end
@@ -532,6 +535,22 @@ module RocotoActor
       @nodes[id] or raise Error, "unknown actor handle"
     end
 
+    # Caller holds @mutex. Moves a node to a terminal state and releases what
+    # only a live actor needs: the reference (threads, socket) and the relaunch
+    # spec. The node itself stays so its handle keeps answering with its state.
+    def retire(node, state)
+      node.state = state
+      reference = node.reference
+      return unless reference
+
+      node.failure = reference.exit_error || node.failure
+      node.exit = reference.exit_status || node.exit
+      @node_ids_by_reference.delete(reference)
+      node.reference = nil
+      node.spec = nil
+      node.restarts = []
+    end
+
     # Caller holds @mutex. Returns the node only when it accepts messages.
     def checked_node(id)
       node = @nodes[id]
@@ -568,7 +587,7 @@ module RocotoActor
       nodes.map do |node, reference|
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         stopped = reference.stop(timeout: [remaining, 0].max, force: force || remaining <= 0)
-        @mutex.synchronize { node.state = :stopped if node.state == :stopping }
+        @mutex.synchronize { retire(node, :stopped) if node.state == :stopping }
         stopped
       end.all?
     end
@@ -577,10 +596,14 @@ module RocotoActor
     # during a boot are settled by the boot future's owner instead.
     def actor_exited(node, reference)
       @mutex.synchronize do
-        return if node.terminal? || node.booting || !node.reference.equal?(reference)
+        return if node.terminal? || !node.reference.equal?(reference)
 
+        if node.booting
+          node.boot_exit = reference
+          return
+        end
         if node.state == :stopping
-          node.state = :stopped
+          retire(node, :stopped)
           return
         end
       end
@@ -599,7 +622,11 @@ module RocotoActor
         live_postorder(node).each { |descendant| descendant.state = :stopping unless descendant.equal?(node) }
         live = node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
         delay = restart_delay(node)
-        node.state = delay ? :restarting : :failed
+        if delay
+          node.state = :restarting
+        else
+          retire(node, :failed)
+        end
         [delay, live]
       end
       enqueue_task { stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) } unless children.empty?
@@ -652,21 +679,22 @@ module RocotoActor
         settle_restart(node, error)
       end
     rescue StandardError
-      settle_restart(node, StandardError.new("relaunch failed"))
+      actor_failed(node)
     end
 
     # A failed relaunch counts as another failure under the same policy.
     def settle_restart(node, error)
-      kill = @mutex.synchronize do
-        next false unless node.booting
+      kill, exited, reference = @mutex.synchronize do
+        next [false, false, nil] unless node.booting
 
         node.booting = false
         node.state = :running if node.state == :restarting && error.nil?
-        !error.nil?
+        [!error.nil?, error.nil? && node.boot_exit.equal?(node.reference), node.reference]
       end
+      return actor_failed(node) if exited
       return unless kill
 
-      node.reference.stop(force: true, timeout: 0)
+      reference&.stop(force: true, timeout: 0)
       actor_failed(node)
     end
 

@@ -639,6 +639,75 @@ class ActorBrokerTest < Minitest::Test
     assert_equal [[:after, nil]], collector.ask(:messages).value(timeout: 2)
   end
 
+  def test_relaunch_that_cannot_launch_counts_as_a_failure
+    actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 1, restart_backoff: 0.01)
+    launcher = RocotoActor.const_get(:Launcher)
+
+    launcher.stub(:launch, ->(*) { raise Errno::EMFILE, "too many open files" }) do
+      assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+      wait_until { actor.state == :failed }
+    end
+
+    assert_equal 1, actor.generation
+    assert_raises(RocotoActor::ActorFailedError) { actor.ask("gone") }
+  end
+
+  def test_diagnostics_report_the_most_recent_incarnation
+    collector = @broker.spawn(CollectorActor, name: "c", restart: :on_failure, max_restarts: 1, restart_backoff: 0.01)
+    collector.tell(op: :boom)
+    wait_until { collector.generation == 2 && collector.state == :running }
+    assert_equal "told to fail", collector.last_failure.remote_message
+
+    pid = @broker.spawn(ExampleActor, "probe", name: "probe").ask(:pid).value(timeout: 2)
+    Process.kill("KILL", pid) # unrelated actor; keeps the collector's second death distinct below
+    collector.tell(op: :record, value: 1)
+    collector.tell(op: :boom)
+    wait_until { collector.state == :failed && collector.last_exit && collector.last_exit.exitstatus == 1 }
+
+    assert_equal "told to fail", collector.last_failure.remote_message
+    assert_equal 1, collector.last_exit.exitstatus
+    assert_equal 2, collector.generation
+  end
+
+  def test_non_standard_errors_in_receive_are_replies_and_exit_is_honored
+    error = assert_raises(RocotoActor::RemoteError) { @database.ask(:not_implemented).value(timeout: 2) }
+    assert_equal "NotImplementedError", error.remote_class
+    assert_equal :running, @database.state
+
+    assert_raises(RocotoActor::ActorStoppedError) { @database.ask(:exit_gracefully).value(timeout: 2) }
+    wait_until { @database.last_exit }
+    assert_equal 4, @database.last_exit.exitstatus
+  end
+
+  def test_actor_dying_right_after_boot_is_treated_as_a_failure
+    actor = @broker.spawn(DiesAfterBootActor, name: "brief")
+
+    wait_until { actor.state == :failed }
+
+    refute actor.alive?
+    assert_equal 5, actor.last_exit.exitstatus
+    restarting = @broker.spawn(DiesAfterBootActor, name: "brief2", restart: :on_failure, max_restarts: 1,
+                                                                  restart_backoff: 0.01)
+    wait_until { restarting.state == :failed }
+    assert_equal 2, restarting.generation
+  end
+
+  def test_invalid_mailbox_options_are_rejected_before_spawning
+    assert_raises(ArgumentError) { @broker.spawn(ExampleActor, "x", mailbox_size: 0) }
+    assert_raises(ArgumentError) { @broker.spawn(ExampleActor, "x", mailbox_bytes: -1) }
+    supervisor = @broker.spawn(SupervisorActor, name: "sup")
+    error = assert_raises(RocotoActor::RemoteError) do
+      supervisor.ask(op: :spawn, name: "bad", options: { mailbox_size: 0 }).value(timeout: 5)
+    end
+    assert_equal "ArgumentError", error.remote_class
+  end
+
+  def test_broker_stop_reaches_children_of_a_failed_boot
+    stopped_broker = RocotoActor::ActorBroker.new
+    assert_raises(RocotoActor::RemoteError) { stopped_broker.spawn(FailingInitSpawnActor, name: "sup") }
+    assert stopped_broker.stop(timeout: 3)
+  end
+
   private
 
   def wait_until(timeout: 3)

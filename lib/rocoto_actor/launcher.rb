@@ -23,7 +23,10 @@ module RocotoActor
       source ||= Object.const_source_location(actor_name)&.first
       raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source
 
-      # Reject unserializable arguments before paying for a process.
+      # Reject bad options and unserializable arguments before paying for a process.
+      raise ArgumentError, "mailbox_size must be positive" unless mailbox_size.is_a?(Integer) && mailbox_size.positive?
+      raise ArgumentError, "mailbox_bytes must be positive" unless mailbox_bytes.is_a?(Integer) && mailbox_bytes.positive?
+
       Transport.dump(arguments: arguments, context: context)
 
       parent_socket, child_socket = UNIXSocket.pair

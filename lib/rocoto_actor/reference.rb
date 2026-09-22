@@ -375,10 +375,13 @@ module RocotoActor
         @pending.clear
         [values, @exit_callbacks]
       end
-      @socket.close unless @socket.closed?
-      Launcher.signal_process_group(@pid, "KILL")
-      discard_control_outbox
       pending.each { |future| future.reject(ActorStoppedError.new("actor process exited")) }
+      discard_control_outbox
+      # Killing the group closes every remaining copy of the socket, so the
+      # reader reaches EOF; let it consume the watchdog's exit report first.
+      Launcher.signal_process_group(@pid, "KILL")
+      @reader&.join(1) unless Thread.current == @reader
+      @socket.close unless @socket.closed?
       callbacks.each(&:call)
     rescue IOError
       nil

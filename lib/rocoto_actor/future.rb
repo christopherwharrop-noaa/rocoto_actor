@@ -25,6 +25,7 @@ module RocotoActor
           if remaining && remaining <= 0
             @error = AskTimeoutError.new("actor did not reply within #{timeout} seconds")
             @resolved = true
+            @condition.broadcast
             true
           else
             @condition.wait(@mutex, remaining)

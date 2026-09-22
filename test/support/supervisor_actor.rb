@@ -53,6 +53,20 @@ class InitSpawnActor
   end
 end
 
+# Replies ready, then dies moments later from a thread started in initialize.
+class DiesAfterBootActor
+  def initialize
+    Thread.new do
+      sleep 0.05
+      exit! 5
+    end
+  end
+
+  def receive(_message)
+    nil
+  end
+end
+
 # Spawns one child successfully, then fails its own initialize.
 class FailingInitSpawnActor
   def initialize

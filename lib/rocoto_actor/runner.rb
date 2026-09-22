@@ -50,7 +50,7 @@ module RocotoActor
         when :ask
           response = begin
             { id: request.fetch(:id), ok: true, result: deliver(actor, request) }
-          rescue StandardError => error
+          rescue StandardError, ScriptError => error
             error_response(request.fetch(:id), error)
           end
           begin
@@ -63,7 +63,7 @@ module RocotoActor
           # the broker's restart policy decides what happens next.
           begin
             deliver(actor, request)
-          rescue StandardError => error
+          rescue StandardError, ScriptError => error
             report_failure(socket, error)
             socket.close unless socket.closed?
             exit! 1
@@ -74,6 +74,15 @@ module RocotoActor
       nil
     rescue SignalException => error
       die_by_signal(socket, error.signo)
+    rescue SystemExit => error
+      socket.close unless socket.closed?
+      exit!(error.status)
+    rescue Exception => error # rubocop:disable Lint/RescueException
+      # Anything else escaping the loop is a bug in the actor or the protocol;
+      # report it and exit non-zero so it is not mistaken for an orderly exit.
+      report_failure(socket, error)
+      socket.close unless socket.closed?
+      exit! 1
     ensure
       socket.close unless socket.closed?
       exit! 0

@@ -167,8 +167,8 @@ bundle exec ruby -Itest test/broker_test.rb
 Latest validation (2026-09-22):
 
 ```text
-broker: 56 runs, 246 assertions, 0 failures, 0 errors
-full suite: 91 runs, 316 assertions, 0 failures, 0 errors
+broker: 62 runs, 267 assertions, 0 failures, 0 errors
+full suite: 98 runs, 340 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -231,6 +231,28 @@ Remove generated `Gemfile.lock` if it is untracked and was created only by local
 - Exit callbacks are bound to the reference they came from (`actor_exited(node, reference)`) so a late reaper from a previous generation cannot fail the current one; exits during any boot (`node.booting`) are owned by the boot settler (`settle_boot` for first boots, `settle_restart` for relaunches, whose failure feeds back into `actor_failed` and counts against the limit).
 - Requests to a `:restarting` node fail fast with `ActorRestartingError` (`node_error`, hence also brokered routes). "Wait" and "queue" policies from the plan were not implemented; fail-fast is the only behavior. No request is ever replayed: `Reference` rejects queued and in-flight futures with `ActorStoppedError` when the process exits.
 - `Reference#alive?` is false for a `:restarting` node between generations.
+
+## Production-readiness review (2026-09-22)
+
+A `/code-review high lib/` pass produced ten findings. Fixed, each with a regression test:
+
+1. A relaunch whose `Launcher.launch` raised left the node `:restarting` forever; it now goes through `actor_failed` like any other failure.
+2. `last_failure`/`last_exit` preferred the previous generation's values; they now prefer the current reference's, falling back to the carried-over ones.
+3. `run_actor` only rescued `StandardError`, so `NotImplementedError`/`LoadError` in `receive` (and any protocol error) killed the actor with exit 0 and no report. Per-message rescues cover `ScriptError`; the method-level path reports anything else with `:actor_error` and exits 1; `SystemExit` exits with its status.
+4. `Future#value`'s timeout branch did not broadcast, leaving other waiters on the same future asleep forever.
+5. The reaper closed the socket under the reader mid-frame, losing the watchdog's `:actor_exit` frame. `actor_exited` now rejects pending futures, kills the group (which produces EOF for the reader), joins the reader for up to a second, then closes.
+6. A process that died after replying ready but before `settle_boot` cleared `booting` was dropped (state `:running`, never restarted). `actor_exited` records `node.boot_exit` during a boot and the settlers call `actor_failed` when they see it.
+9. `unregister` left a failed boot's children with a dangling `parent_id`: `descendant?` and `parent` now tolerate it, and `broker.stop` sweeps every node rather than only roots so such children are stopped.
+10. `mailbox_size`/`mailbox_bytes` were validated only after the process was spawned; the launcher validates first.
+
+Documented, not fixed:
+
+7. While an actor is blocked in `BrokerClient#request` it reads and defers every incoming `:ask`/`:tell` without bound; the application-side mailbox limits bound only the unsent outbox, so a caller that floods an actor during its long `call` grows that actor's memory. Acceptable at the intended scale; a credit-based flow control or a bound that fails the call would be the fix if needed.
+8. Terminal nodes are retained forever and root spawns scan all nodes. Node metadata retention is accepted per the scale decision above; the soak showed each terminal node also pinned its `Reference` (thread stacks, closed socket) and `spec` (constructor arguments), so `retire(node, state)` now copies `exit_error`/`exit_status` onto the node and releases the reference and spec at every terminal transition. `ask`/`tell` and the boot settlers read the reference under the mutex because a concurrent `retire` can null it.
+
+Soak harness: `test/soak/soak.rb` (`SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb`) runs continuous ask/tell traffic with injected crashes, external kills, told-message exceptions, stops, and respawns; samples threads/fds/children/zombies/RSS/live heap slots and live `Reference`/`Future`/`ActorHandle` counts after `GC.start`; and fails on upward trends, a zombie persisting across consecutive samples, children surviving `broker.stop`, `broker.stop` returning false, or unexpected error classes. It logs any `Reference#stop` that returns false with its pid and elapsed time. It is not part of `rake test`.
+
+Soak results (2026-09-22, this container): a 10-minute run (~900k operations, ~250 injected failures) showed threads and file descriptors flat during the run and back to baseline after `broker.stop`, no surviving children, and only expected error classes. Findings: a single-sample zombie (the normal exit-to-`waitpid` window; the check now requires persistence), `Reference`/`Future` counts growing with terminal nodes (fixed by `retire`), and one `broker.stop` returning false while every process was gone a second later, which did not reproduce in later runs; `StopDiagnostics` in the harness will name the reference if it recurs. After `retire`, a 3-minute run passed every check: live `Reference` count flat at 15–17 and zero after `broker.stop`, `Future` count flat, `heap_live_slots` flat, and RSS climbing only during the first minute (24→36 MB) before plateauing at ~37 MB, so the earlier steady RSS growth was terminal-node retention plus heap warm-up rather than a leak. A multi-hour run before production is still worthwhile for the `broker.stop` false return that did not reproduce.
 
 ## Immediate implementation plan
 
