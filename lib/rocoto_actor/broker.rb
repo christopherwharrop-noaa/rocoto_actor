@@ -399,8 +399,13 @@ module RocotoActor
       respond_error(source, request[:request_id], rejection, release_response) if rejection
     end
 
+    # Broker threads report failures through error_handler, so Ruby's own
+    # thread-death trace would only duplicate that on stderr.
     def start_lifecycle_worker
-      worker = Thread.new { run_lifecycle_worker }
+      worker = Thread.new do
+        Thread.current.report_on_exception = false
+        run_lifecycle_worker
+      end
       worker.name = "rocoto-actor-broker-lifecycle" if worker.respond_to?(:name=)
       worker
     end
@@ -863,7 +868,10 @@ module RocotoActor
     end
 
     def start_service
-      service = Thread.new { run_service }
+      service = Thread.new do
+        Thread.current.report_on_exception = false
+        run_service
+      end
       service.name = "rocoto-actor-broker" if service.respond_to?(:name=)
       service
     end
