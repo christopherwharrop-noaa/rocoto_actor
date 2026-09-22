@@ -1,4 +1,14 @@
-# Linux Validation Handoff
+# Linux Validation
+
+## Status
+
+Executed on 2026-09-22 (Ruby 3.4.10, Linux 7.0.12-linuxkit, Ubuntu 26.04 container under Docker Desktop). Results are recorded in "Results" below; the checklist that follows them is kept as the specification to re-run against. Rerun with:
+
+```sh
+bundle exec rake                                          # lint and suite
+bundle exec ruby -Ilib test/validation/fault_matrix.rb    # fault matrix (~1 min)
+SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb
+```
 
 ## Objective
 
@@ -17,42 +27,73 @@ The library exists to keep an application responsive when an actor or a subproce
 - `ask` returns a future without waiting for socket capacity. A full mailbox raises `MailboxFullError`.
 - A future timeout is terminal and does not cancel queued or executing actor work.
 - Graceful stop drains accepted messages. Force stop and graceful timeout send `KILL` to the actor process group.
-- `stop` returns `true` only when the whole process group is observed gone before its deadline; otherwise it returns `false`.
+- `stop` returns `true` when the whole process group is observed gone. After a deadline forces a `KILL`, it waits up to `Reference::KILL_CONFIRMATION_GRACE` (0.5 s) more to confirm, so `false` means the group was still present after `KILL`, not merely that the deadline passed.
 - The watchdog polls for application death every 100 milliseconds and kills its process group if the application or actor worker exits.
 
 Primary implementation files:
 
-- `lib/rocoto_actor.rb`: spawning, startup protocol, transport deadline, process-group helpers, actor loop
-- `lib/rocoto_actor/runner.rb`: watchdog and actor worker lifecycle
-- `lib/rocoto_actor/reference.rb`: mailbox, reader/writer/reaper threads, stopping, process-group status
+- `lib/rocoto_actor/broker.rb`: `ActorBroker`, the only public way to create actors; lifecycle nodes, routing, restart policy
+- `lib/rocoto_actor/launcher.rb`: process creation, boot request, process-group helpers (private)
+- `lib/rocoto_actor/runner.rb`: watchdog and actor worker lifecycle, exit reporting
+- `lib/rocoto_actor/reference.rb`: mailbox, reader/writer/reaper threads, stopping, process-group status (private)
 - `lib/rocoto_actor/future.rb`: result, error, and terminal timeout state
-- `lib/rocoto_actor/transport.rb`: framed tagged-JSON codec
+- `lib/rocoto_actor/transport.rb`: framed tagged-JSON codec (private)
 
 ## Accepted limitations
 
-- `SIGTERM` and `SIGKILL` do not take effect while a process remains in `D` state. The parent application must nevertheless stay responsive and `stop` must return `false` at its deadline.
-- A subprocess can escape process-group containment by deliberately creating a new session or process group.
+- `SIGTERM` and `SIGKILL` do not take effect while a process remains in `D` state. The parent application must nevertheless stay responsive and `stop` must return `false` once its deadline and the kill-confirmation grace have passed.
+- A subprocess can escape process-group containment by deliberately creating a new session or process group (confirmed by probe P5).
+- Ruby itself can wedge under `RLIMIT_NPROC`: when thread creation fails at the limit, the VM sometimes blocks in a futex and ignores `TERM`; only `KILL` removes it. Observed twice while writing the fault matrix and not reproduced on the recorded run, where spawn failed cleanly with `ThreadError`. The library cannot recover a wedged VM; deployments must keep process limits above need (for example a cgroup `pids.max` with headroom) and rely on `KILL`.
+- `RLIMIT_NPROC` counts the uid's processes and threads on the whole host, so a container cannot compute a meaningful limit for it; the fault matrix finds one by probing.
 - Actors run with the application's UID, environment, working directory, resource limits, and filesystem/network access.
 - A timed-out future does not cancel work. Late responses are discarded.
 - Actor source files must be independently loadable and free of application-startup side effects.
 
-## Evidence collected on macOS
+## Results (2026-09-22, Linux)
 
-The latest complete run passed:
+Suite: `108 runs, 405 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10 here and on Ruby 3.2, 3.3, 3.4 (Ubuntu) plus 3.4 (macOS) in CI. Fault matrix (`test/validation/fault_matrix.rb`): 30 probes, 29 passed, 1 note, no leaked threads, descriptors, children, or zombies at the end.
 
-```text
-30 runs, 66 assertions, 0 failures, 0 errors, 0 skips
-```
+| Probe | Result | Evidence |
+|---|---|---|
+| C1/C2 400 asks from 8 threads racing graceful and force stop | pass | every future terminal (result or `ActorStoppedError`), no asker blocked, `stop=true` |
+| C3 8 concurrent graceful+force stops | pass | all returned `true`, actor gone |
+| C4 300 replies racing `Future#value` timeouts | pass | 289 timeouts, 11 results; every future's outcome stable on a second `value` |
+| C5 worker `KILL` with 30 requests queued/executing | pass | 2 results, 28 `ActorStoppedError`, node `:failed` |
+| C6 mailbox count and byte limits, 8 threads × 100 asks | pass | 13 accepted, 787 `MailboxFullError`, no blocking, all settled after force stop |
+| C7 180 actors spawned/asked/stopped/crashed/killed from 6 threads | pass | back to baseline threads and fds, 0 zombies |
+| P1 worker `TERM`/`KILL` while a forked descendant holds the socket | pass | pending request rejected, holder killed by the watchdog, `last_exit` shows the signal |
+| P2 watchdog `KILL` while worker idle and busy | pass | node `:failed`, worker gone |
+| P3 application normal exit / `TERM` / `KILL` with idle, busy, descendant-holding actors | pass | application, worker, and holder all gone within 3 s |
+| P5 descendant in its own process group | note | survives stop, as documented; the probe kills it |
+| P8 worker ignoring `TERM` | pass | `stop(timeout: 1)` returned `true` in 1.0 s |
+| T2 malformed replies: oversized header, invalid JSON, unknown tag, missing id | pass | request rejected with `ActorStoppedError`, node `:failed`, `last_failure` "malformed reply: …", unrelated actor unaffected |
+| T2 error reply with non-string fields | pass | coerced `RemoteError`, actor keeps running |
+| T2 truncated frame then silence | pass | behaves as a hung actor: caller timeout, `stop` works |
+| T3 3,000 fuzzed frames | pass | only `SerializationError`, `Error`, `EOFError`, or a decode; never another exception |
+| T4 parent RSS while filling a 4 MiB mailbox | pass | +4.3 MB, released after stop |
+| T5 `RLIMIT_NOFILE` = 48 | pass | 37 actors, then `Errno::EMFILE` raised cleanly; broker recovered after freeing descriptors |
+| T5 `RLIMIT_NPROC` at probed threshold + 40 | pass (this run) | 30 actors, then `ThreadError` raised cleanly; see accepted limitations for the wedge seen on other runs |
+| T6 descriptors in worker and watchdog | pass | `/dev/null` ×3, one anonymous socket, Ruby's eventfd and epoll only |
+| D1 `SIGSTOP`ped worker | pass | ask times out terminally, other actors responsive, `stop` confirms the `KILL` |
+| S1 socket | pass | `socketpair`, no filesystem path |
+| S4 50,000 decoded symbols | pass | mortal dynamic symbols 111 → 50,111 → 111 after GC |
 
-Additional bounded probes passed:
+Cases covered by the normal suite rather than the matrix: startup timeout with a boot that ignores `TERM`; socket back-pressure not blocking `ask` or `stop`; descendants ignoring `TERM` removed by group `KILL`; worker exit with an inherited socket; application death with background children; codec rejection of unsupported values, cycles, invalid UTF-8, oversized frames, and non-finite floats; read timeouts across partial frames.
 
-- 50 concurrent ask/stop iterations with 10,000 total request attempts, no blocked threads or changing future outcomes.
-- 20 repetitions of worker death while a descendant inherited the actor socket.
-- 20 repetitions of application parent death while an actor-owned background child was running.
-- No leaked test-created processes after those runs.
-- Gem build included all library files, including the runner.
+Not reproduced here, with reasoning:
 
-Do not treat this macOS evidence as proof of Linux behavior.
+- True `D` state needs a blocked-I/O fixture on disposable storage. `SIGSTOP` was used as the "unresponsive but killable" analogue; the `D`-state case differs only in that `KILL` is delayed, which is exactly what `stop` returning `false` after the grace reports.
+- PID churn confusing `alive?`/`stop`: the watchdog pid is held as a zombie until this process's own reaper calls `waitpid`, so it cannot be recycled before its exit is observed. After that, `process_group_alive?` probes the pgid; a recycled pid becoming a new group leader in the few milliseconds between reap and confirmation is theoretically possible and would only make `wait_for_exit` report `false`, never signal an unrelated group (nothing signals after the reaper has run). Not worth a fixture at `pid_max` 4,194,304.
+
+Findings made while writing the matrix, all fixed with regression tests in the suite:
+
+1. A reply without `:id` killed the reader thread, and the reaper's `join` re-raised that exception and died before running the broker's exit callback, leaving the node `:running` forever. Malformed frames are now protocol violations that stop the actor; the join swallows reader exceptions.
+2. `RemoteError.new` raised on non-string fields after the future had left the pending table, so the caller could never be answered. Fields are coerced.
+3. `stop` returned `false` whenever the deadline forced a `KILL`, even when the `KILL` worked milliseconds later, so callers could not tell "killed late" from "still alive". A 0.5 s confirmation grace makes `false` mean the latter.
+
+Security review outcome: the socket is an anonymous `socketpair`; only the socket and `/dev/null` cross `exec` (`close_others: true`, verified in `/proc`); the child environment carries only the four `ROCOTO_ACTOR_*` variables plus the inherited environment; class names are resolved with `const_get(name, false)` and never evaluated; the codec is tagged JSON with frame, nesting, and encoding limits checked before allocation, and remote error fields become strings on a `RemoteError`, never a reconstructed class. Same-uid actor code can read what the application can read and signal its processes; that is stated in `README.md`.
+
+Earlier macOS evidence (30 runs, 66 assertions, before the broker existed) is superseded by the CI macOS job.
 
 ## Required Linux review
 
@@ -158,16 +199,16 @@ An Ubuntu container under Docker Desktop uses the Docker Linux VM kernel. It is 
 
 ## Supported Ruby versions
 
-The gem currently declares Ruby `>= 3.1`. At minimum, run the full suite on Ruby 3.1 and the newest supported Ruby. Include another maintained intermediate version if practical. Differences in `Process.spawn`, `fork`, JSON, `Thread`, and signal behavior are especially relevant.
+The gem declares Ruby `>= 3.2`. CI runs lint and the suite on 3.2, 3.3, and 3.4 on Ubuntu and on 3.4 on macOS. Differences in `Process.spawn`, `fork`, JSON, `Thread`, and signal behavior are especially relevant when adding a version.
 
 ## Completion criteria
 
-- Findings are reported before production fixes are made.
-- Every confirmed serious finding has a deterministic or bounded regression test.
-- Full tests pass on the tested Linux/Ruby matrix.
-- Stress runs finish without blocked Ruby threads, zombies, or leaked actor descendants.
-- Parent responsiveness is demonstrated during a real or representative blocked-I/O scenario.
-- Any remaining limitation is explicit in `README.md` and accepted before release.
+- Findings are reported before production fixes are made. (Done: recorded above and in `docs/actor-broker-handoff.md`.)
+- Every confirmed serious finding has a deterministic or bounded regression test. (Done.)
+- Full tests pass on the tested Linux/Ruby matrix. (Done: CI.)
+- Stress runs finish without blocked Ruby threads, zombies, or leaked actor descendants. (Done: C7 and the soak harness.)
+- Parent responsiveness is demonstrated during a real or representative blocked-I/O scenario. (Representative only: D1 uses `SIGSTOP`; a true `D`-state run on disposable storage remains open if storage or NFS failure is central to the deployment's threat model.)
+- Any remaining limitation is explicit in `README.md` and accepted before release. (`README.md` states the `D`-state, escape, and same-uid limitations; the `RLIMIT_NPROC` wedge is stated here and should be added to `README.md` if deployments run under tight process limits.)
 
 ## Suggested prompt for the container session
 

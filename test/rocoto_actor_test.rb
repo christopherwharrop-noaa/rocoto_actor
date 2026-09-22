@@ -180,6 +180,19 @@ class RocotoActorTest < Minitest::Test
     assert_raises(RocotoActor::ActorStoppedError) { @actor.ask("too late") }
   end
 
+  def test_stop_confirms_a_kill_that_lands_after_the_deadline
+    pid = @actor.ask(:pid).value(timeout: 2)
+    Process.kill("STOP", pid) # unresponsive to the stop message, but KILL still applies
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    stopped = @actor.stop(timeout: 0.05)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+    assert stopped, "stop reported false although the KILL removed the group"
+    assert_operator elapsed, :<, 1
+    refute @actor.alive?
+  end
+
   def test_graceful_stop_forces_actor_after_timeout
     pending = @actor.ask(:hang)
 

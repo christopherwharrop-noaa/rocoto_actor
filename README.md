@@ -70,7 +70,7 @@ Actors process one message at a time. `ask` serializes and places a message in a
 
 `Future#value` blocks only the calling thread and accepts an optional timeout. A timeout is terminal for that future: subsequent calls raise the same `RocotoActor::AskTimeoutError`, and a later actor response is discarded. Timing out does not cancel queued or executing work. Unexpected actor or transport failure rejects all unresolved futures with `RocotoActor::ActorStoppedError`.
 
-`stop` rejects new messages, drains messages already sent to the actor, and waits up to five seconds for the whole actor process group to exit. Set a different failsafe with `stop(timeout: 30)`. If graceful draining exceeds the deadline, the process group is sent `KILL` and unresolved futures fail with `RocotoActor::ActorStoppedError`. Use `stop(force: true)` to skip draining. The method returns `true` when the process group is confirmed gone and `false` when the deadline expires. Signals cannot terminate a process while it remains in uninterruptible `D` state.
+`stop` rejects new messages, drains messages already sent to the actor, and waits up to five seconds for the whole actor process group to exit. Set a different failsafe with `stop(timeout: 30)`. If graceful draining exceeds the deadline, the process group is sent `KILL` and unresolved futures fail with `RocotoActor::ActorStoppedError`. Use `stop(force: true)` to skip draining. The method returns `true` when the process group is confirmed gone. After a `KILL` it waits up to half a second more for that confirmation, so `false` means the group was still present after being killed, as with a process in uninterruptible `D` state, which signals cannot terminate until the kernel operation returns.
 
 Actors run in fresh Ruby processes. The actor class must be named and defined in a dedicated file that can be loaded independently without starting the application or performing other process-wide side effects. `spawn` normally locates the defining file automatically, or it can be specified with `broker.spawn(Worker, source: "/path/to/worker.rb")`. The startup exchange has a five-second deadline by default; use `start_timeout:` to change it.
 
@@ -203,10 +203,11 @@ bundle exec rake test
 bundle exec rubocop
 ```
 
-The normal suite runs in well under a minute. A separate soak harness runs continuous traffic with injected failures and checks for leaks; it is not part of `rake test`:
+The normal suite runs in well under a minute. Two further harnesses are not part of `rake test`: a soak run of continuous traffic with injected failures that checks for leaks, and a Linux fault matrix of signal, resource-exhaustion, malformed-frame, and containment probes (results in `docs/linux-validation.md`):
 
 ```sh
 SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb
+bundle exec ruby -Ilib test/validation/fault_matrix.rb
 ```
 
 CI runs lint and the suite on Ruby 3.2 through 3.4 on Ubuntu, plus Ruby 3.4 on macOS, and can run the soak on demand.

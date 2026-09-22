@@ -6,6 +6,7 @@ require_relative "support/example_actor"
 require_relative "support/process_actor"
 require_relative "support/supervisor_actor"
 require_relative "support/tell_actor"
+require_relative "validation/support"
 
 class ActorBrokerTest < Minitest::Test
   def setup
@@ -97,6 +98,29 @@ class ActorBrokerTest < Minitest::Test
 
     assert_equal (1..40).to_a, results.sort
     assert_equal 41, counter.ask(:tick).value(timeout: 1)
+  end
+
+  def test_malformed_replies_stop_the_actor_and_reject_the_request
+    %i[missing_id unknown_tag].each do |kind|
+      actor = @broker.spawn(MalformedReplyActor, name: "malformed-#{kind}")
+
+      future = actor.ask(kind: kind)
+
+      assert_raises(RocotoActor::ActorStoppedError, kind.to_s) { future.value(timeout: 3) }
+      wait_until { actor.state == :failed }
+      assert_match(/malformed reply/, actor.last_failure.remote_message, kind.to_s)
+    end
+    assert_equal "database: fine", @database.ask("fine").value(timeout: 1)
+  end
+
+  def test_error_reply_with_wrong_field_types_is_still_a_remote_error
+    actor = @broker.spawn(MalformedReplyActor, name: "malformed-fields")
+
+    error = assert_raises(RocotoActor::RemoteError) { actor.ask(kind: :bad_backtrace).value(timeout: 3) }
+
+    assert_equal "7", error.remote_class
+    assert_equal ["1"], error.remote_backtrace
+    assert_equal :running, actor.state
   end
 
   def test_brokered_call_timeout_rejects_a_hanging_target

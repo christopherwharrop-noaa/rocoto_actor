@@ -15,6 +15,10 @@ module RocotoActor
 
   class Reference
     DEFAULT_STOP_TIMEOUT = 5
+    # After a deadline forces a KILL, stop waits this much longer to confirm the
+    # group is gone, so false means "still present after KILL" (for example a
+    # process in uninterruptible sleep), not merely "the deadline passed".
+    KILL_CONFIRMATION_GRACE = 0.5
 
     attr_reader :pid
 
@@ -130,7 +134,7 @@ module RocotoActor
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       if force
         force_stop
-        return wait_for_exit(deadline)
+        return wait_for_exit(kill_deadline(deadline))
       end
 
       shutdown = @pending_mutex.synchronize do
@@ -158,7 +162,7 @@ module RocotoActor
       wait_for_exit(deadline)
     rescue ActorStoppedError, AskTimeoutError, IOError, SystemCallError
       force_stop
-      wait_for_exit(deadline)
+      wait_for_exit(kill_deadline(deadline))
     end
 
     def alive?
@@ -298,8 +302,15 @@ module RocotoActor
           future.reject(RemoteError.new(reply[:error_class], reply[:message], reply[:backtrace]))
         end
       end
-    rescue IOError, SystemCallError, Error => error
+    rescue IOError, SystemCallError => error
       fail_pending(ActorStoppedError.new(error.message))
+    rescue StandardError => error
+      # A frame the actor should never send (malformed, wrong types, missing
+      # fields): treat it as the actor breaking the protocol and stop it.
+      @pending_mutex.synchronize do
+        @exit_error ||= RemoteError.new(error.class.name, "malformed reply: #{error.message}", [])
+      end
+      fail_pending(ActorStoppedError.new("actor sent a malformed reply: #{error.message}"))
     ensure
       force_stop
     end
@@ -381,10 +392,23 @@ module RocotoActor
       # Killing the group closes every remaining copy of the socket, so the
       # reader reaches EOF; let it consume the watchdog's exit report first.
       Launcher.signal_process_group(@pid, "KILL")
-      @reader&.join(1) unless Thread.current == @reader
+      join_reader
       @socket.close unless @socket.closed?
       callbacks.each(&:call)
     rescue IOError
+      nil
+    end
+
+    def kill_deadline(deadline)
+      [deadline, Process.clock_gettime(Process::CLOCK_MONOTONIC) + KILL_CONFIRMATION_GRACE].max
+    end
+
+    # Join re-raises whatever ended the reader; nothing here may propagate.
+    def join_reader
+      return if Thread.current == @reader
+
+      @reader&.join(1)
+    rescue Exception # rubocop:disable Lint/RescueException
       nil
     end
 

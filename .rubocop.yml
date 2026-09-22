@@ -32,9 +32,15 @@ Lint/RescueException:
 Naming/RescuedExceptionsVariableName:
   PreferredName: error
 
+# The soak and fault-matrix harnesses are operator scripts, not library code.
 Style/FormatStringToken:
   Exclude:
     - "test/soak/**/*"
+    - "test/validation/**/*"
+
+Style/SpecialGlobalVars:
+  Exclude:
+    - "test/validation/**/*"
 
 # These are commands that report whether they succeeded, not predicates; a
 # trailing ? would promise no side effects.
