@@ -11,6 +11,8 @@ class ExampleActor
     case message
     when :fail then raise ArgumentError, "requested failure"
     when :hang then sleep 10
+    when :crash then exit! 3
+    when :pid then Process.pid
     when :slow
       sleep 0.05
       "#{@prefix}: slow"

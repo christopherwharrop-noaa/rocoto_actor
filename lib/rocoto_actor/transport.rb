@@ -105,7 +105,11 @@ module RocotoActor
       when "integer" then Integer(payload, 10)
       when "symbol" then payload.to_sym
       when "actor_handle"
-        ActorHandle.new(payload, socket: Thread.current[:rocoto_actor_transport_socket])
+        if RocotoActor.worker_process?
+          ActorHandle.new(payload, socket: Thread.current[:rocoto_actor_transport_socket])
+        else
+          ActorHandle.new(payload, broker: Thread.current[:rocoto_actor_broker])
+        end
       when "array" then payload.map { |item| decode(item) }
       when "hash"
         payload.to_h { |key, item| [decode(key), decode(item)] }

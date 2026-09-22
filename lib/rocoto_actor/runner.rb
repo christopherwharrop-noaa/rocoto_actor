@@ -10,8 +10,7 @@ module RocotoActor
       socket = UNIXSocket.for_fd(Integer(ENV.fetch("ROCOTO_ACTOR_FD")))
       parent_pid = Integer(ENV.fetch("ROCOTO_ACTOR_PARENT_PID"))
       worker_pid = fork { run_worker(socket) }
-      socket.close
-      supervise(worker_pid, parent_pid)
+      watch(socket, worker_pid, parent_pid)
     rescue Exception => error # rubocop:disable Lint/RescueException
       report_boot_error(socket, error)
       socket&.close
@@ -19,33 +18,138 @@ module RocotoActor
     end
 
     def run_worker(socket)
+      RocotoActor.worker_process!
       require ENV.fetch("ROCOTO_ACTOR_SOURCE")
       actor_class = constantize(ENV.fetch("ROCOTO_ACTOR_CLASS"))
       boot = Transport.read(socket)
       raise Error, "expected actor boot message" unless boot&.fetch(:op) == :boot
 
+      boot_id = boot.fetch(:id)
+      # The broker serves requests from here on, so initialize may spawn children.
+      RocotoActor.context = ActorContext.new(socket, boot[:context]&.fetch(:actor_id, nil))
       actor = actor_class.new(*boot.fetch(:arguments))
-      Transport.write(socket, op: :ready)
-      RocotoActor.run_actor(socket, actor)
+      Transport.write(socket, id: boot_id, ok: true, result: nil)
+      run_actor(socket, actor)
     rescue Exception => error # rubocop:disable Lint/RescueException
-      report_boot_error(socket, error)
+      report_boot_error(socket, error, boot_id)
       socket&.close
       exit! 1
     end
     private_class_method :run_worker
 
-    def supervise(worker_pid, parent_pid)
+    def run_actor(socket, actor)
+      deferred = RocotoActor.broker_client(socket).deferred_frames
+      loop do
+        request = deferred.shift || Transport.read(socket)
+        break unless request
+
+        case request.fetch(:op)
+        when :stop
+          Transport.write(socket, id: request.fetch(:id), ok: true, result: nil)
+          break
+        when :ask
+          response = begin
+            { id: request.fetch(:id), ok: true, result: deliver(actor, request) }
+          rescue StandardError => error
+            error_response(request.fetch(:id), error)
+          end
+          begin
+            Transport.write(socket, response)
+          rescue SerializationError => error
+            Transport.write(socket, error_response(request.fetch(:id), error))
+          end
+        when :tell
+          # No reply can carry an exception, so a failure ends the actor and
+          # the broker's restart policy decides what happens next.
+          begin
+            deliver(actor, request)
+          rescue StandardError => error
+            report_failure(socket, error)
+            socket.close unless socket.closed?
+            exit! 1
+          end
+        end
+      end
+    rescue EOFError, IOError, SystemCallError
+      nil
+    rescue SignalException => error
+      die_by_signal(socket, error.signo)
+    ensure
+      socket.close unless socket.closed?
+      exit! 0
+    end
+    private_class_method :run_actor
+
+    # Ruby turns a fatal signal into an exception; re-deliver it with the default
+    # disposition so the watchdog reports a signal death rather than exit 0.
+    def die_by_signal(socket, signo)
+      socket.close unless socket.closed?
+      Signal.trap(signo, "SYSTEM_DEFAULT")
+      Process.kill(signo, Process.pid)
+      sleep 1
+      exit!(128 + signo)
+    rescue ArgumentError, SystemCallError
+      exit!(128 + signo)
+    end
+    private_class_method :die_by_signal
+
+    def deliver(actor, request)
+      RocotoActor.context.sender = request[:sender]
+      actor.receive(request[:message])
+    ensure
+      RocotoActor.context.sender = nil
+    end
+    private_class_method :deliver
+
+    def report_failure(socket, error)
+      response = error_response(nil, error)
+      response.delete(:id)
+      Transport.write(socket, response.merge(op: :actor_error))
+    rescue IOError, SystemCallError, SerializationError
+      nil
+    end
+    private_class_method :report_failure
+
+    # A RemoteError crossing another actor boundary keeps its original class,
+    # message, and backtrace rather than nesting a RemoteError per hop.
+    def error_response(id, error)
+      if error.is_a?(RemoteError)
+        { id: id, ok: false, error_class: error.remote_class, message: error.remote_message,
+          backtrace: error.remote_backtrace }
+      else
+        { id: id, ok: false, error_class: error.class.name, message: error.message, backtrace: error.backtrace || [] }
+      end
+    end
+    private_class_method :error_response
+
+    # The watchdog owns the actor's process group and kills it when the worker
+    # or the application dies. It holds no policy; the broker is the supervisor.
+    # It keeps its copy of the socket so it can report how the worker exited.
+    def watch(socket, worker_pid, parent_pid)
       loop do
         terminate_group unless Process.ppid == parent_pid
         break if Process.waitpid(worker_pid, Process::WNOHANG)
 
         sleep RocotoActor::PARENT_CHECK_INTERVAL
       end
+      report_exit(socket, $?) # rubocop:disable Style/SpecialGlobalVars
       terminate_group
     rescue Errno::ECHILD
       terminate_group
     end
-    private_class_method :supervise
+    private_class_method :watch
+
+    # Tells the parent how the worker process ended, for diagnostics only; the
+    # broker's restart policy does not depend on it.
+    def report_exit(socket, status)
+      return unless status && socket && !socket.closed?
+
+      Transport.write(socket, op: :actor_exit, exitstatus: status.exitstatus, termsig: status.termsig)
+      socket.close
+    rescue IOError, SystemCallError
+      nil
+    end
+    private_class_method :report_exit
 
     def terminate_group
       Process.kill("KILL", -Process.getpgrp)
@@ -60,17 +164,15 @@ module RocotoActor
     end
     private_class_method :constantize
 
-    def report_boot_error(socket, error)
+    # Answers the boot request when its id is known; a failure before the boot
+    # message was read is reported as a bare boot_error frame.
+    def report_boot_error(socket, error, boot_id = nil)
       return unless socket && !socket.closed?
 
-      Transport.write(
-        socket,
-        op: :boot_error,
-        error_class: error.class.name,
-        message: error.message,
-        backtrace: error.backtrace || []
-      )
-    rescue IOError, SystemCallError
+      response = error_response(boot_id, error)
+      response[:op] = :boot_error unless boot_id
+      Transport.write(socket, response)
+    rescue IOError, SystemCallError, SerializationError
       nil
     end
     private_class_method :report_boot_error
