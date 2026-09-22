@@ -17,9 +17,7 @@ module RocotoActor
 
     def dump(message)
       payload = JSON.generate(encode(message))
-      if payload.bytesize > MAX_FRAME_SIZE
-        raise SerializationError, "message exceeds #{MAX_FRAME_SIZE} bytes"
-      end
+      raise SerializationError, "message exceeds #{MAX_FRAME_SIZE} bytes" if payload.bytesize > MAX_FRAME_SIZE
 
       payload
     rescue JSON::JSONError, EncodingError => error
@@ -44,7 +42,7 @@ module RocotoActor
     end
 
     def read(io, timeout: nil)
-      deadline = timeout && monotonic_time + timeout
+      deadline = timeout && (monotonic_time + timeout)
       header = read_exactly(io, HEADER_SIZE, deadline: deadline)
       return if header.nil?
 
@@ -57,7 +55,7 @@ module RocotoActor
       raise SerializationError, error.message
     end
 
-    def encode(value, seen = {}, depth = 0)
+    def encode(value, seen = {}.compare_by_identity, depth = 0)
       raise SerializationError, "value exceeds #{MAX_NESTING} nesting levels" if depth > MAX_NESTING
 
       case value
@@ -86,12 +84,12 @@ module RocotoActor
     private_class_method :encode
 
     def encode_container(value, seen)
-      raise SerializationError, "cyclic values are not supported" if seen.key?(value.object_id)
+      raise SerializationError, "cyclic values are not supported" if seen.key?(value)
 
-      seen[value.object_id] = true
+      seen[value] = true
       yield
     ensure
-      seen.delete(value.object_id)
+      seen.delete(value)
     end
     private_class_method :encode_container
 

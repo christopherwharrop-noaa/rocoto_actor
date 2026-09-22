@@ -25,6 +25,7 @@ class SupervisorActor
         RocotoActor.context.spawn(ForwardingActor, RocotoActor.context.handle, name: message[:name])
     when :call then @children.fetch(message[:name]).call(message[:message], timeout: 1)
     when :stop then @children.fetch(message[:name]).stop(timeout: 2)
+    when :stop_with then @children.fetch(message[:name]).stop(timeout: 5, force: message.fetch(:force))
     when :stop_handle then message.fetch(:handle).stop(timeout: 1)
     when :handle then RocotoActor.context.handle
     when :ask_child then @children.fetch(message[:name]).ask("no")
@@ -47,6 +48,7 @@ class InitSpawnActor
 
   def receive(message)
     return @children if message == :children
+
     exit! 3 if message == :crash
 
     @children.map { |child| child.call(message, timeout: 5) }

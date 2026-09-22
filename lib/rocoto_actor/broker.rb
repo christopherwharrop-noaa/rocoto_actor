@@ -21,6 +21,9 @@ module RocotoActor
     DEFAULT_RESTART_WINDOW = 60
     DEFAULT_RESTART_BACKOFF = 0.1
     POLICY_OPTIONS = %i[restart max_restarts restart_window restart_backoff].freeze
+    DEFAULT_ERROR_HANDLER = lambda do |error, context|
+      warn "rocoto_actor: #{context}: #{error.class}: #{error.message}"
+    end
 
     # Logical lifecycle record for one brokered actor. Every actor process is a
     # direct child of the application; parent/child structure exists only here.
@@ -43,10 +46,15 @@ module RocotoActor
     # have not yet been written to its socket; a source at this limit is not read
     # until a response drains. route_timeout applies when a request has no timeout.
     # Spawn and stop requests from actors run on up to max_lifecycle_workers threads
-    # with at most max_pending_lifecycle_requests waiting for one.
+    # with at most max_pending_lifecycle_requests waiting for one. error_handler
+    # receives (error, context) for failures on the broker's own threads, which
+    # are reported rather than allowed to kill the thread; it must not raise.
     def initialize(max_routes: DEFAULT_MAX_ROUTES, max_routes_per_actor: DEFAULT_MAX_ROUTES_PER_ACTOR,
                    route_timeout: DEFAULT_ROUTE_TIMEOUT, max_lifecycle_workers: DEFAULT_MAX_LIFECYCLE_WORKERS,
-                   max_pending_lifecycle_requests: DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS)
+                   max_pending_lifecycle_requests: DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS,
+                   error_handler: DEFAULT_ERROR_HANDLER)
+      raise ArgumentError, "error_handler must respond to call" unless error_handler.respond_to?(:call)
+
       raise ArgumentError, "max_routes must be positive" unless max_routes.positive?
       raise ArgumentError, "max_routes_per_actor must be positive" unless max_routes_per_actor.positive?
       raise ArgumentError, "route_timeout must be positive" unless valid_timeout?(route_timeout)
@@ -60,6 +68,7 @@ module RocotoActor
       @route_timeout = route_timeout
       @max_lifecycle_workers = max_lifecycle_workers
       @max_pending_lifecycle_requests = max_pending_lifecycle_requests
+      @error_handler = error_handler
       @lifecycle_queue = [] # [source, request, release_response] or an internal callable
       @lifecycle_workers = []
       @idle_lifecycle_workers = 0
@@ -277,8 +286,14 @@ module RocotoActor
     end
 
     def validate_policy(restart:, max_restarts:, restart_window:, restart_backoff:)
-      raise ArgumentError, "restart must be one of #{RESTART_POLICIES.join(', ')}" unless RESTART_POLICIES.include?(restart)
-      raise ArgumentError, "max_restarts must be a positive integer" unless max_restarts.is_a?(Integer) && max_restarts.positive?
+      unless RESTART_POLICIES.include?(restart)
+        raise ArgumentError,
+              "restart must be one of #{RESTART_POLICIES.join(', ')}"
+      end
+      unless max_restarts.is_a?(Integer) && max_restarts.positive?
+        raise ArgumentError,
+              "max_restarts must be a positive integer"
+      end
       raise ArgumentError, "restart_window must be positive" unless valid_timeout?(restart_window)
       unless restart_backoff.is_a?(Numeric) && restart_backoff >= 0 && restart_backoff.to_f.finite?
         raise ArgumentError, "restart_backoff must be a non-negative number"
@@ -331,7 +346,11 @@ module RocotoActor
 
       reference&.stop(force: true, timeout: 0)
       unregister(node)
-      enqueue_task { stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) } unless children.empty?
+      unless children.empty?
+        enqueue_task do
+          stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true)
+        end
+      end
       Launcher.startup_error(reference, error)
     end
 
@@ -386,6 +405,9 @@ module RocotoActor
       worker
     end
 
+    # A job that raises anything is reported and, for an actor request, answered
+    # with an error; the worker keeps running. Should the thread die anyway, it
+    # frees its slot so the next request starts a replacement.
     def run_lifecycle_worker
       loop do
         job = @mutex.synchronize do
@@ -396,12 +418,29 @@ module RocotoActor
         end
         return unless job
 
-        if job.is_a?(Array)
-          perform_lifecycle(*job)
-        else
-          job.call
+        begin
+          if job.is_a?(Array)
+            perform_lifecycle(*job)
+          else
+            job.call
+          end
+        rescue Exception => error # rubocop:disable Lint/RescueException
+          report_error(error, "lifecycle job")
+          if job.is_a?(Array)
+            source, request, release_response = job
+            respond_error(source, request[:request_id], Error.new("#{error.class}: #{error.message}"), release_response)
+          end
+          raise unless error.is_a?(StandardError)
         end
       end
+    ensure
+      @mutex.synchronize { @lifecycle_workers.delete(Thread.current) }
+    end
+
+    def report_error(error, context)
+      @error_handler.call(error, context)
+    rescue Exception # rubocop:disable Lint/RescueException
+      nil
     end
 
     def perform_lifecycle(source, request, release_response)
@@ -465,11 +504,12 @@ module RocotoActor
       node = @mutex.synchronize do
         requester = source_node(source)
         target = @nodes[request[:handle_id]] or raise Error, "unknown actor handle"
-        raise Error, "actor #{target.path} is not a descendant of #{requester.path}" unless descendant?(target, requester.id)
+        raise Error, "actor #{target.path} is not a descendant of #{requester.path}" unless descendant?(target,
+                                                                                                        requester.id)
 
         target
       end
-      stop_subtrees([node], timeout: timeout, force: request[:force] == true)
+      stop_subtrees([node], timeout: timeout, force: request[:force] ? true : false)
     end
 
     # Caller holds @mutex.
@@ -632,7 +672,11 @@ module RocotoActor
         end
         [delay, live]
       end
-      enqueue_task { stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) } unless children.empty?
+      unless children.empty?
+        enqueue_task do
+          stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true)
+        end
+      end
       enqueue_task(delay: delay) { enqueue_lifecycle_job { relaunch(node) } } if delay
     end
 
@@ -814,7 +858,7 @@ module RocotoActor
     # Caller holds @mutex. One thread per broker runs route expiries and
     # lifecycle tasks so no actor thread blocks on another actor's shutdown.
     def wake_service
-      @service ||= start_service
+      @service = start_service unless @service&.alive?
       @service_condition.signal
     end
 
@@ -839,14 +883,22 @@ module RocotoActor
             end
 
             next_deadline = (@expiries.each_value.map(&:first) + @tasks.map(&:first)).min
-            @service_condition.wait(@mutex, next_deadline && next_deadline - now)
+            @service_condition.wait(@mutex, next_deadline && (next_deadline - now))
           end
         end
         return unless expired
 
-        expired.each { |future, (_deadline, timeout)| future.expire(timeout) }
-        tasks.each(&:call)
+        expired.each { |future, (_deadline, timeout)| guarded("route expiry") { future.expire(timeout) } }
+        tasks.each { |task| guarded("service task") { task.call } }
       end
+    end
+
+    # Runs one unit of service work; a StandardError is reported and the thread
+    # continues. Anything worse still ends the thread, which wake_service replaces.
+    def guarded(context)
+      yield
+    rescue StandardError => error
+      report_error(error, context)
     end
   end
 end

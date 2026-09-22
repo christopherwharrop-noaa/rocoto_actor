@@ -70,7 +70,7 @@ module RocotoActor
           end
         end
       end
-    rescue EOFError, IOError, SystemCallError
+    rescue IOError, SystemCallError
       nil
     rescue SignalException => error
       die_by_signal(socket, error.signo)
@@ -111,18 +111,22 @@ module RocotoActor
     private_class_method :deliver
 
     def report_failure(socket, error)
-      write_report(socket, error) { |reported| error_response(nil, reported).tap { |r| r.delete(:id) }.merge(op: :actor_error) }
+      write_report(socket, error) do |reported|
+        error_response(nil, reported).tap do |r|
+          r.delete(:id)
+        end.merge(op: :actor_error)
+      end
     end
     private_class_method :report_failure
 
     # Writes the report built by the block; if the error itself cannot be
     # serialized (for example a message with invalid UTF-8), reports that
     # SerializationError instead so the parent still learns why the actor died.
-    def write_report(socket, error)
-      Transport.write(socket, yield(error))
-    rescue SerializationError => serialization_error
+    def write_report(socket, original)
+      Transport.write(socket, yield(original))
+    rescue SerializationError => error
       begin
-        Transport.write(socket, yield(serialization_error))
+        Transport.write(socket, yield(error))
       rescue IOError, SystemCallError, SerializationError
         nil
       end

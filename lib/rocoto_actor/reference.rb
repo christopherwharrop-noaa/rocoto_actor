@@ -263,7 +263,8 @@ module RocotoActor
         @control_outbox = []
         values
       end
-      discarded.each { |_payload, on_done| on_done&.call }
+      # discarded is an Array of [payload, on_done] pairs, not a Hash.
+      discarded.map(&:last).each { |on_done| on_done&.call }
     end
 
     def read_replies
@@ -297,7 +298,7 @@ module RocotoActor
           future.reject(RemoteError.new(reply[:error_class], reply[:message], reply[:backtrace]))
         end
       end
-    rescue EOFError, IOError, SystemCallError, Error => error
+    rescue IOError, SystemCallError, Error => error
       fail_pending(ActorStoppedError.new(error.message))
     ensure
       force_stop

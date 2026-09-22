@@ -72,21 +72,21 @@ class Soak
 
   def spawn_population
     @handles[:database] = @broker.spawn(ExampleActor, "database", name: "database", restart: :on_failure,
-                                                                   max_restarts: 1_000, restart_window: 1,
-                                                                   restart_backoff: 0.01)
-    @handles[:counter] = @broker.spawn(CountingActor, name: "counter")
-    @handles[:collector] = @broker.spawn(CollectorActor, name: "collector", restart: :on_failure,
-                                                             max_restarts: 1_000, restart_window: 1,
-                                                             restart_backoff: 0.01)
-    @handles[:supervisor] = @broker.spawn(InitSpawnActor, 1, 2, name: "supervisor", restart: :on_failure,
                                                                   max_restarts: 1_000, restart_window: 1,
                                                                   restart_backoff: 0.01)
+    @handles[:counter] = @broker.spawn(CountingActor, name: "counter")
+    @handles[:collector] = @broker.spawn(CollectorActor, name: "collector", restart: :on_failure,
+                                                         max_restarts: 1_000, restart_window: 1,
+                                                         restart_backoff: 0.01)
+    @handles[:supervisor] = @broker.spawn(InitSpawnActor, 1, 2, name: "supervisor", restart: :on_failure,
+                                                                max_restarts: 1_000, restart_window: 1,
+                                                                restart_backoff: 0.01)
     3.times do |index|
       @handles[:"forwarder#{index}"] = @broker.spawn(ForwardingActor, @handles[:database], name: "forwarder#{index}",
-                                                                                       restart: :on_failure,
-                                                                                       max_restarts: 1_000,
-                                                                                       restart_window: 1,
-                                                                                       restart_backoff: 0.01)
+                                                                                           restart: :on_failure,
+                                                                                           max_restarts: 1_000,
+                                                                                           restart_window: 1,
+                                                                                           restart_backoff: 0.01)
     end
   end
 
@@ -180,7 +180,11 @@ class Soak
       zombies.size,
       zombies,
       rss_kb,
-      (@broker.roots.size rescue 0),
+      begin
+        @broker.roots.size
+      rescue StandardError
+        0
+      end,
       GC.stat(:heap_live_slots),
       ObjectSpace.each_object(RocotoActor::Reference).count,
       ObjectSpace.each_object(RocotoActor::Future).count,
@@ -198,8 +202,8 @@ class Soak
   # Direct children by pid and state, excluding the ps process doing the listing.
   def child_processes
     `ps -o pid=,stat=,comm= --ppid #{Process.pid}`.lines.map(&:split)
-                                                    .reject { |_pid, _state, command| command == "ps" }
-                                                    .to_h { |pid, state, _command| [Integer(pid), state] }
+                                                  .reject { |_pid, _state, command| command == "ps" }
+                                                  .to_h { |pid, state, _command| [Integer(pid), state] }
   rescue StandardError
     {}
   end
@@ -216,7 +220,9 @@ class Soak
     problem("unexpected remote error in #{name}: #{error.message}") unless EXPECTED_ERRORS.include?(error.remote_class)
   rescue RocotoActor::Error => error
     count(:"#{name}_#{error.class.name}")
-    problem("unexpected error in #{name}: #{error.class}: #{error.message}") unless EXPECTED_ERRORS.include?(error.class.name)
+    unless EXPECTED_ERRORS.include?(error.class.name)
+      problem("unexpected error in #{name}: #{error.class}: #{error.message}")
+    end
   rescue StandardError => error
     count(:"#{name}_#{error.class.name}")
     problem("unexpected exception in #{name}: #{error.class}: #{error.message}")
@@ -230,8 +236,8 @@ class Soak
     @stats_mutex.synchronize { @problems << message unless @problems.include?(message) }
   end
 
-  def named_thread(name, &block)
-    thread = Thread.new(&block)
+  def named_thread(name, &)
+    thread = Thread.new(&)
     thread.name = name
     thread
   end
@@ -248,7 +254,7 @@ class Soak
         first = head.sum(&metric).fdiv(head.size)
         last = tail.sum(&metric).fdiv(tail.size)
         limit = case metric
-                when :rss_kb, :live_slots then first * 1.25 + 20_000
+                when :rss_kb, :live_slots then (first * 1.25) + 20_000
                 when :references, :handles then first + 50 # terminal nodes are retained by design
                 else first + 5
                 end
@@ -262,7 +268,9 @@ class Soak
       problem("zombie persisted across samples: #{persistent.inspect}") unless persistent.empty?
     end
     problem("#{final.children} child processes outlived the broker") if final.children.positive?
-    problem("threads did not return to baseline: #{baseline.threads} -> #{final.threads}") if final.threads > baseline.threads + 1
+    if final.threads > baseline.threads + 1
+      problem("threads did not return to baseline: #{baseline.threads} -> #{final.threads}")
+    end
     problem("fds did not return to baseline: #{baseline.fds} -> #{final.fds}") if final.fds > baseline.fds + 2
 
     if @problems.empty?

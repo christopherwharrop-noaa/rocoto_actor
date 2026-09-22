@@ -11,7 +11,7 @@ module RocotoActor
     end
 
     def value(timeout: nil)
-      deadline = timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      deadline = timeout && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout)
 
       loop do
         timed_out = @mutex.synchronize do
@@ -21,7 +21,7 @@ module RocotoActor
             return @result
           end
 
-          remaining = deadline && deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          remaining = deadline && (deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC))
           if remaining && remaining <= 0
             @error = AskTimeoutError.new("actor did not reply within #{timeout} seconds")
             @resolved = true

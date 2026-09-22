@@ -29,7 +29,7 @@ class ExampleActor
       "x" * (RocotoActor::Transport::MAX_FRAME_SIZE + 1)
     when :stdio_isolated
       null = File.stat(File::NULL)
-      [STDIN, STDOUT, STDERR].all? { |io| io.stat.rdev == null.rdev }
+      [$stdin, $stdout, $stderr].all? { |io| io.stat.rdev == null.rdev }
     else "#{@prefix}: #{message}"
     end
   end

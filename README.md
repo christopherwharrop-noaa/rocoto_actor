@@ -184,6 +184,8 @@ end
 
 Inside an actor a handle supports `call` and `stop` only. `ask` returns a `RocotoActor::Future` and is an application-side API; calling it, or `state`, `children`, and the other broker queries, inside an actor raises `RocotoActor::Error` naming the method and the alternative. `context.spawn` accepts `name:`, `source:`, `start_timeout:`, `mailbox_size:`, and `mailbox_bytes:`; it blocks until the child is ready or fails, and a boot failure is raised as `RocotoActor::RemoteError` with the child's error class. Children may be spawned from `initialize` as well as from `receive`; an actor is registered with the broker in a `:starting` state while its constructor runs, and nested initialization (children that spawn grandchildren in their own constructors) does not tie up broker threads. If `initialize` raises, the actor is discarded along with any children it already spawned, and the spawner sees the constructor's error. `broker.roots` lists the live top-level actors. An actor can stop handles of its own descendants and nothing else. Spawn and stop requests run on a small pool of broker threads (`max_lifecycle_workers:`, default 2) with a bounded queue (`max_pending_lifecycle_requests:`, default 100); a request beyond the queue fails with `RocotoActor::BrokerBusyError`.
 
+The broker's own threads never die silently: a failure while running a route expiry, a scheduled task, or an actor's spawn/stop request is passed to the broker's `error_handler:` (a callable receiving the error and a short context string; the default writes one line to the application's standard error) and the thread carries on. Replace it to route these into your logging.
+
 Routing is bounded and does not create a thread per request. `RocotoActor::ActorBroker.new(max_routes: 1_000, max_routes_per_actor: 100)` limits requests awaiting a target across the broker and unwritten responses owed to one actor. A request beyond `max_routes` fails with `RocotoActor::BrokerBusyError`; an actor at `max_routes_per_actor` is not read from until its responses drain, without affecting other actors.
 
 If the application exits, the watchdog detects it within 100 milliseconds and terminates the actor group independently of the worker's state. A process blocked in uninterruptible kernel sleep remains until the kernel operation returns, but the application does not wait for it.
@@ -196,5 +198,15 @@ RocotoActor is a reliability bulkhead, not a sandbox for hostile code. Actor wor
 
 ```sh
 bundle install
+bundle exec rake          # rubocop, then the test suite
 bundle exec rake test
+bundle exec rubocop
 ```
+
+The normal suite runs in well under a minute. A separate soak harness runs continuous traffic with injected failures and checks for leaks; it is not part of `rake test`:
+
+```sh
+SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb
+```
+
+CI runs lint and the suite on Ruby 3.2 through 3.4 on Ubuntu, plus Ruby 3.4 on macOS, and can run the soak on demand.

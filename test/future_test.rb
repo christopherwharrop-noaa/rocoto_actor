@@ -6,7 +6,10 @@ require_relative "../lib/rocoto_actor"
 class FutureTest < Minitest::Test
   def test_timeout_wakes_other_waiters
     future = RocotoActor::Future.new
-    waiter = Thread.new { future.value }
+    waiter = Thread.new do
+      Thread.current.report_on_exception = false # the timeout error below is expected
+      future.value
+    end
 
     assert_raises(RocotoActor::AskTimeoutError) { future.value(timeout: 0.05) }
 

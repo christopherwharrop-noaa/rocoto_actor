@@ -25,7 +25,10 @@ module RocotoActor
 
       # Reject bad options and unserializable arguments before paying for a process.
       raise ArgumentError, "mailbox_size must be positive" unless mailbox_size.is_a?(Integer) && mailbox_size.positive?
-      raise ArgumentError, "mailbox_bytes must be positive" unless mailbox_bytes.is_a?(Integer) && mailbox_bytes.positive?
+      unless mailbox_bytes.is_a?(Integer) && mailbox_bytes.positive?
+        raise ArgumentError,
+              "mailbox_bytes must be positive"
+      end
 
       Transport.dump(arguments: arguments, context: context)
 
@@ -64,8 +67,8 @@ module RocotoActor
 
     # Launches and waits for the actor to become ready. Used by low-level tests;
     # the broker uses launch so that the actor is registered while it boots.
-    def spawn(actor_class, *arguments, start_timeout: START_TIMEOUT, **options)
-      reference, boot = launch(actor_class, *arguments, **options)
+    def spawn(actor_class, *, start_timeout: START_TIMEOUT, **)
+      reference, boot = launch(actor_class, *, **)
       boot.value(timeout: start_timeout)
       reference
     rescue StandardError => error
@@ -96,12 +99,11 @@ module RocotoActor
 
     def terminate_process_group(pid)
       signal_process_group(pid, "KILL")
-      reaper = Thread.new do
+      Thread.new do
         Process.waitpid(pid)
       rescue Errno::ECHILD
         nil
       end
-      reaper
     end
 
     def signal_process_group(pid, signal)

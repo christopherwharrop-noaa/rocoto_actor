@@ -516,7 +516,7 @@ class ActorBrokerTest < Minitest::Test
     # Backoff delays (0.3s, 0.6s) exceed the window (0.5s); under timestamp
     # pruning the count would never reach max_restarts.
     actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 2,
-                                                       restart_window: 0.5, restart_backoff: 0.3)
+                                             restart_window: 0.5, restart_backoff: 0.3)
 
     3.times do |attempt|
       assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
@@ -531,7 +531,7 @@ class ActorBrokerTest < Minitest::Test
 
   def test_healthy_uptime_resets_the_restart_count
     actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 1,
-                                                       restart_window: 0.2, restart_backoff: 0.01)
+                                             restart_window: 0.2, restart_backoff: 0.01)
 
     assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
     wait_until { actor.state == :running && actor.generation == 2 }
@@ -550,7 +550,11 @@ class ActorBrokerTest < Minitest::Test
     crashers = Array.new(3) do |index|
       broker.spawn(ExampleActor, "c", name: "c#{index}", restart: :on_failure, restart_backoff: 0.3)
     end
-    crashers.each { |crasher| crasher.ask(:crash).value(timeout: 2) rescue nil }
+    crashers.each do |crasher|
+      crasher.ask(:crash).value(timeout: 2)
+    rescue StandardError
+      nil
+    end
     wait_until { crashers.all? { |crasher| crasher.state == :restarting } }
 
     child = supervisor.ask(op: :spawn, name: "child", arguments: ["ok"]).value(timeout: 5)
@@ -571,9 +575,67 @@ class ActorBrokerTest < Minitest::Test
     assert_equal "RocotoActor::SerializationError", error.remote_class
   end
 
+  def test_service_thread_survives_a_failing_task_and_reports_it
+    reported = []
+    broker = RocotoActor::ActorBroker.new(error_handler: ->(error, context) { reported << [error.class, context] })
+    target = broker.spawn(ExampleActor, "target")
+    worker = broker.spawn(ForwardingActor, target)
+    worker.ask(message: "warm", timeout: 1).value(timeout: 2) # starts the service thread
+
+    broker.send(:enqueue_task) { raise "task exploded" }
+    wait_until { reported.any? }
+
+    assert_equal [[RuntimeError, "service task"]], reported
+    error = assert_raises(RocotoActor::RemoteError) { worker.ask(message: :hang, timeout: 0.1).value(timeout: 2) }
+    assert_equal "RocotoActor::AskTimeoutError", error.remote_class # expiries still run
+  ensure
+    broker&.stop(timeout: 2, force: true)
+  end
+
+  def test_lifecycle_worker_recovers_from_a_fatal_launch_error
+    reported = []
+    broker = RocotoActor::ActorBroker.new(max_lifecycle_workers: 1,
+                                          error_handler: ->(error, context) { reported << [error.class, context] })
+    supervisor = broker.spawn(SupervisorActor, name: "sup")
+    launcher = RocotoActor.const_get(:Launcher)
+    original = launcher.method(:launch)
+    calls = 0
+    flaky = lambda do |*args, **options|
+      calls += 1
+      raise NoMemoryError, "simulated" if calls == 1
+
+      original.call(*args, **options)
+    end
+
+    launcher.stub(:launch, flaky) do
+      error = assert_raises(RocotoActor::RemoteError) do
+        supervisor.ask(op: :spawn, name: "first", arguments: ["a"]).value(timeout: 5)
+      end
+      assert_match(/NoMemoryError/, error.remote_message)
+      child = supervisor.ask(op: :spawn, name: "second", arguments: ["b"]).value(timeout: 5)
+      assert_equal "b: ok", child.ask("ok").value(timeout: 2)
+    end
+
+    assert_equal [[NoMemoryError, "lifecycle job"]], reported
+  ensure
+    broker&.stop(timeout: 2, force: true)
+  end
+
+  def test_remote_stop_treats_force_by_truthiness
+    supervisor = @broker.spawn(SupervisorActor, name: "sup")
+    child = supervisor.ask(op: :spawn, name: "child", arguments: ["c"]).value(timeout: 5)
+    child.ask(:hang)
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    supervisor.ask(op: :stop_with, name: "child", force: 1).value(timeout: 5)
+
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 3
+    assert_equal :stopped, child.state
+  end
+
   def test_restart_limit_marks_the_actor_failed
     actor = @broker.spawn(ExampleActor, "flaky", name: "flaky", restart: :on_failure, max_restarts: 2,
-                                                                  restart_backoff: 0.01)
+                                                 restart_backoff: 0.01)
 
     2.times do |attempt|
       assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
@@ -746,7 +808,7 @@ class ActorBrokerTest < Minitest::Test
     refute actor.alive?
     assert_equal 5, actor.last_exit.exitstatus
     restarting = @broker.spawn(DiesAfterBootActor, name: "brief2", restart: :on_failure, max_restarts: 1,
-                                                                  restart_backoff: 0.01)
+                                                   restart_backoff: 0.01)
     wait_until { restarting.state == :failed }
     assert_equal 2, restarting.generation
   end

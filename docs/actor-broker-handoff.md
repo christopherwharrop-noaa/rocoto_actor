@@ -7,7 +7,7 @@ This document preserves the design discussion and current implementation state f
 ## Repository and baseline
 
 - Repository: `/home/admin/rocoto_actor`
-- Runtime used for validation: Ruby 3.4.10 on Linux (linuxkit)
+- Runtime used for validation: Ruby 3.4.10 on Linux (linuxkit); the gem requires Ruby >= 3.2 (raised from 3.1 on 2026-09-22 because 3.1 is end-of-life)
 - Existing actor model: one watchdog process group per actor, one Unix socket pair between the application and that actor, parent-side reader/writer/reaper threads, bounded outbound mailbox.
 - The previously identified concurrent `Reference#stop` race was fixed in `lib/rocoto_actor/reference.rb` and covered by `test_concurrent_stop_waits_for_existing_shutdown`.
 - Before the broker prototype, the suite passed with 35 runs and 70 assertions. The concurrent ask/stop and timeout/load stress probes passed.
@@ -167,8 +167,8 @@ bundle exec ruby -Itest test/broker_test.rb
 Latest validation (2026-09-22):
 
 ```text
-broker: 66 runs, 280 assertions, 0 failures, 0 errors
-full suite: 102 runs, 353 assertions, 0 failures, 0 errors
+broker: 69 runs, 290 assertions, 0 failures, 0 errors
+full suite: 105 runs, 363 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -257,7 +257,19 @@ A `/code-review ultra` pass (2026-09-22, standard diff review; the launch note a
 3. `report_failure`/`report_boot_error` dropped the report when the error itself could not be serialized (invalid UTF-8 in a message); `write_report` falls back to reporting the `SerializationError`, matching the ask path.
 4. A local named `roots` in `ActorBroker#stop` held every node; renamed `nodes`.
 
-The lock-ordering and settlement-race review the note asked for has therefore only had the `/code-review high` pass; a follow-up review with that focus, or a targeted manual read of `actor_exited`/`actor_failed`/`settle_boot`/`settle_restart`/`relaunch`/`stop_subtrees` against `Reference#stop`/`actor_exited`, is still worthwhile.
+A second `/code-review ultra` (whole repository, base tag `review-base` on an empty-tree commit, with `docs/review-focus.md` in the diff as the reviewers' brief) produced three findings, all fixed with tests:
+
+5. `run_service` ran expiries and tasks unguarded, and `wake_service` never replaced a dead thread, so one raising callback silently ended route timeouts and restart scheduling for the broker's lifetime. Each unit of work is now `guarded`; a `StandardError` is reported and the loop continues, and `wake_service` starts a replacement whenever the thread is not alive.
+6. A non-`StandardError` (e.g. `NoMemoryError`) escaping a lifecycle job killed the worker, left it counted in `@lifecycle_workers`, and never answered the requesting actor. The worker now reports any exception, answers actor requests with an error, re-raises only non-`StandardError`s, and removes itself from the pool in `ensure` so the next request starts a replacement.
+7. `stop_child` compared `force == true` while the in-process path used truthiness; unified on truthiness.
+
+These introduced the first observability hook: `ActorBroker.new(error_handler:)`, a callable `(error, context)` defaulting to a one-line `warn`; `report_error` never lets the handler's own exception propagate.
+
+Tagging note: a bare commit hash after `ultra` is read as a focus note, and a base with no shared history triggers a whole-repository cost confirmation that only an interactive terminal session can answer; the extension's command path cannot. `review-since-initial` (tag on `22a97a2`) is the fallback base that needs no confirmation. The note passed on the command line is never delivered to the cloud reviewers; put review guidance in a file in the diff instead.
+
+Whether the whole-repository reviewers used `docs/review-focus.md` is unclear: none of the findings cite its invariants by number, though finding 5 is invariant 9 in substance. The lock-ordering and settlement-race interleavings it lists have therefore not been explicitly confirmed by an independent reviewer; a targeted manual read of `actor_exited`/`actor_failed`/`settle_boot`/`settle_restart`/`relaunch`/`stop_subtrees` against `Reference#stop`/`actor_exited` is still worthwhile.
+
+Lint and CI (2026-09-22): RuboCop 1.91 with `.rubocop.yml` (target 3.2, new cops enabled, line length 120, `Metrics` disabled on purpose, rescued exceptions named `error`, three success-reporting commands allow-listed from `Naming/PredicateMethod`); `bundle exec rake` runs rubocop then the suite. The first `rubocop -A` pass silently broke every actor-exit path: the unsafe `Style/HashEachMethods` rewrote `discarded.each { |_payload, on_done| ... }` to `each_value` on what is an Array of pairs. Prefer `rubocop -a` (safe only) and run the suite after any auto-correct. `.github/workflows/ci.yml` runs lint and the suite on Ruby 3.2–3.4 on Ubuntu plus 3.4 on macOS, and a manual `workflow_dispatch` soak job taking `soak_seconds`. The macOS job has not been run yet; the suite has only ever executed on Linux.
 
 Soak harness: `test/soak/soak.rb` (`SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb`) runs continuous ask/tell traffic with injected crashes, external kills, told-message exceptions, stops, and respawns; samples threads/fds/children/zombies/RSS/live heap slots and live `Reference`/`Future`/`ActorHandle` counts after `GC.start`; and fails on upward trends, a zombie persisting across consecutive samples, children surviving `broker.stop`, `broker.stop` returning false, or unexpected error classes. It logs any `Reference#stop` that returns false with its pid and elapsed time. It is not part of `rake test`.
 
