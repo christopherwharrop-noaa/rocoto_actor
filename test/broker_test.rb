@@ -34,7 +34,7 @@ class ActorBrokerTest < Minitest::Test
   end
 
   def test_handle_has_an_opaque_serialized_form
-    payload = RocotoActor::Transport.dump(@database)
+    payload = RocotoActor.const_get(:Transport).dump(@database)
 
     assert_operator payload.bytesize, :<, 200
     refute_includes payload, "Mutex"
@@ -313,9 +313,18 @@ class ActorBrokerTest < Minitest::Test
     assert_empty supervisor.children
   end
 
-  def test_process_launcher_is_not_public
+  def test_internals_are_not_public
     refute_respond_to RocotoActor, :spawn
     assert_raises(NameError) { RocotoActor::Launcher }
+    # Module#constants omits private constants; const_defined? still sees them.
+    # Runner is loaded only in actor processes, so it is not checked here.
+    %i[Launcher Reference Transport BrokerClient].each do |name|
+      assert RocotoActor.const_defined?(name), "#{name} should exist"
+      refute_includes RocotoActor.constants, name, "#{name} should be private"
+    end
+    %i[ActorBroker ActorHandle ActorContext Future ExitStatus RemoteError].each do |name|
+      assert_includes RocotoActor.constants, name, "#{name} should be public"
+    end
   end
 
   def test_actor_spawns_children_during_initialization

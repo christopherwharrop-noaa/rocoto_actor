@@ -42,4 +42,5 @@ module RocotoActor
       end
     end
   end
+  private_constant :BrokerClient
 end

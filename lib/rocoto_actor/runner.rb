@@ -202,6 +202,7 @@ module RocotoActor
     end
     private_class_method :report_boot_error
   end
-end
+  private_constant :Runner
 
-RocotoActor::Runner.run
+  Runner.run
+end

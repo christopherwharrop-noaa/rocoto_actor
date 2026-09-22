@@ -156,4 +156,5 @@ module RocotoActor
     end
     private_class_method :monotonic_time
   end
+  private_constant :Transport
 end

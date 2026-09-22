@@ -26,7 +26,7 @@ class ExampleActor
     when :invalid_utf8_result
       "\xFF".b
     when :oversized_result
-      "x" * (RocotoActor::Transport::MAX_FRAME_SIZE + 1)
+      "x" * (RocotoActor.const_get(:Transport)::MAX_FRAME_SIZE + 1)
     when :stdio_isolated
       null = File.stat(File::NULL)
       [$stdin, $stdout, $stderr].all? { |io| io.stat.rdev == null.rdev }

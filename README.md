@@ -25,7 +25,7 @@ result = future.value(timeout: 30)
 broker.stop
 ```
 
-`RocotoActor::ActorBroker` is the only way to create actors. It owns every actor process, socket, and lifecycle thread in the application process and hands out `RocotoActor::ActorHandle` values; there is no lower-level spawn API.
+`RocotoActor::ActorBroker` is the only way to create actors. It owns every actor process, socket, and lifecycle thread in the application process and hands out `RocotoActor::ActorHandle` values; there is no lower-level spawn API. The public API is `ActorBroker`, `ActorHandle`, `ActorContext` (as `RocotoActor.context` inside an actor), `Future`, `ExitStatus`, and the error classes; everything else under `RocotoActor` is a private constant.
 
 ## Constructor arguments
 

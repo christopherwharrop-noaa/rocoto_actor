@@ -16,6 +16,10 @@ require_relative "rocoto_actor/broker"
 
 # Actors are created only through RocotoActor::ActorBroker in the application
 # process, or through RocotoActor.context inside an actor.
+#
+# Public API: ActorBroker, ActorHandle, ActorContext, Future, ExitStatus, the
+# error classes, and the module functions below. Reference, Transport,
+# BrokerClient, Launcher, and Runner are private constants.
 module RocotoActor
   PARENT_CHECK_INTERVAL = 0.1
   START_TIMEOUT = 5

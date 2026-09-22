@@ -406,4 +406,5 @@ module RocotoActor
       true
     end
   end
+  private_constant :Reference
 end

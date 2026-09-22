@@ -167,8 +167,8 @@ bundle exec ruby -Itest test/broker_test.rb
 Latest validation (2026-09-22):
 
 ```text
-broker: 69 runs, 290 assertions, 0 failures, 0 errors
-full suite: 105 runs, 363 assertions, 0 failures, 0 errors
+broker: 69 runs, 314 assertions, 0 failures, 0 errors
+full suite: 105 runs, 387 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -268,6 +268,8 @@ These introduced the first observability hook: `ActorBroker.new(error_handler:)`
 Tagging note: a bare commit hash after `ultra` is read as a focus note, and a base with no shared history triggers a whole-repository cost confirmation that only an interactive terminal session can answer; the extension's command path cannot. `review-since-initial` (tag on `22a97a2`) is the fallback base that needs no confirmation. The note passed on the command line is never delivered to the cloud reviewers; put review guidance in a file in the diff instead.
 
 Whether the whole-repository reviewers used `docs/review-focus.md` is unclear: none of the findings cite its invariants by number, though finding 5 is invariant 9 in substance. The lock-ordering and settlement-race interleavings it lists have therefore not been explicitly confirmed by an independent reviewer; a targeted manual read of `actor_exited`/`actor_failed`/`settle_boot`/`settle_restart`/`relaunch`/`stop_subtrees` against `Reference#stop`/`actor_exited` is still worthwhile.
+
+Public surface (2026-09-22): `Reference`, `Transport`, `BrokerClient`, and `Runner` joined `Launcher` as `private_constant`s, so the API is exactly `ActorBroker`, `ActorHandle`, `ActorContext`, `Future`, `ExitStatus`, the errors, and the `RocotoActor` module functions (`context`, `worker_process?`, `broker_client`). Tests that exercise internals directly reach them with `RocotoActor.const_get(:Name)` (`test/transport_test.rb`, `test/rocoto_actor_test.rb`, `test/soak/soak.rb`, and one support actor). `Runner.run` is invoked from inside the module namespace at the end of `runner.rb` because the constant is private. `test_internals_are_not_public` asserts the split using `Module#constants`, which omits private constants.
 
 Lint and CI (2026-09-22): RuboCop 1.91 with `.rubocop.yml` (target 3.2, new cops enabled, line length 120, `Metrics` disabled on purpose, rescued exceptions named `error`, three success-reporting commands allow-listed from `Naming/PredicateMethod`); `bundle exec rake` runs rubocop then the suite. The first `rubocop -A` pass silently broke every actor-exit path: the unsafe `Style/HashEachMethods` rewrote `discarded.each { |_payload, on_done| ... }` to `each_value` on what is an Array of pairs. Prefer `rubocop -a` (safe only) and run the suite after any auto-correct. `.github/workflows/ci.yml` runs lint and the suite on Ruby 3.2–3.4 on Ubuntu plus 3.4 on macOS, and a manual `workflow_dispatch` soak job taking `soak_seconds`. The macOS job has not been run yet; the suite has only ever executed on Linux.
 
@@ -372,6 +374,7 @@ Normal suite:
 - [x] tell: application tell ordered with asks and without sender; actor fan-out with tell and reply via `context.sender`; routed ask carries sender; tell then call from one actor arrive in order; tell to stopped target rejected for application and actors; exception in told message fails the actor and is recorded in `last_failure`; exception in told message triggers restart policy
 - [x] `ask` inside an actor raises with guidance
 - [x] actor killed from outside (SIGKILL to the worker) is restarted under `:on_failure` and fails under the default policy; the per-actor watchdog process holds no policy
+- [x] internals are private constants and the public constants are enumerable
 - [x] backoff longer than the window cannot defeat `max_restarts`; healthy uptime resets the count; relaunch jobs do not consume the lifecycle request budget; unserializable crash messages are still reported
 - [x] exit reasons: `last_exit` reports termsig for SIGKILL and SIGTERM, exitstatus for `exit!` and told-message exceptions (with `last_failure`), nil while running and after stop, retained across restart
 - [x] restart: same handle and path with new generation; restarted actor recreates children; requests during restart fail fast locally and via broker; restart limit leaves `:failed`; stop during backoff cancels relaunch; policy from `context.spawn`; policy validation; default policy does not restart

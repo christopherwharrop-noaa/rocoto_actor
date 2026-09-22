@@ -24,9 +24,11 @@ EXPECTED_ERRORS = %w[
   RocotoActor::AskTimeoutError RocotoActor::MailboxFullError
 ].freeze
 
+REFERENCE = RocotoActor.const_get(:Reference) # internal; instrumented and counted here
+
 # Logs any Reference#stop that could not confirm the process group was gone.
 module StopDiagnostics
-  def stop(timeout: RocotoActor::Reference::DEFAULT_STOP_TIMEOUT, force: false)
+  def stop(timeout: REFERENCE::DEFAULT_STOP_TIMEOUT, force: false)
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     result = super
     unless result
@@ -36,7 +38,7 @@ module StopDiagnostics
     result
   end
 end
-RocotoActor::Reference.prepend(StopDiagnostics)
+REFERENCE.prepend(StopDiagnostics)
 
 class Soak
   Sample = Struct.new(:at, :threads, :fds, :children, :zombies, :zombie_pids, :rss_kb, :actors, :live_slots,
@@ -186,7 +188,7 @@ class Soak
         0
       end,
       GC.stat(:heap_live_slots),
-      ObjectSpace.each_object(RocotoActor::Reference).count,
+      ObjectSpace.each_object(REFERENCE).count,
       ObjectSpace.each_object(RocotoActor::Future).count,
       ObjectSpace.each_object(RocotoActor::ActorHandle).count
     )
