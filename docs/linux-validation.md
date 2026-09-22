@@ -51,7 +51,7 @@ Primary implementation files:
 
 ## Results (2026-09-22, Linux)
 
-Suite: `108 runs, 405 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10 here and on Ruby 3.2, 3.3, 3.4 (Ubuntu) plus 3.4 (macOS) in CI. Fault matrix (`test/validation/fault_matrix.rb`): 30 probes, 29 passed, 1 note, no leaked threads, descriptors, children, or zombies at the end.
+Suite: `110 runs, 412 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10 here and on Ruby 3.2, 3.3, 3.4 (Ubuntu) plus 3.4 (macOS) in CI. Fault matrix (`test/validation/fault_matrix.rb`): 30 probes, 29 passed, 1 note, no leaked threads, descriptors, children, or zombies at the end.
 
 | Probe | Result | Evidence |
 |---|---|---|

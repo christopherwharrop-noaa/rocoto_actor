@@ -167,8 +167,8 @@ bundle exec ruby -Itest test/broker_test.rb
 Latest validation (2026-09-22):
 
 ```text
-broker: 71 runs, 329 assertions, 0 failures, 0 errors
-full suite: 108 runs, 405 assertions, 0 failures, 0 errors
+broker: 73 runs, 336 assertions, 0 failures, 0 errors
+full suite: 110 runs, 412 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -267,7 +267,16 @@ These introduced the first observability hook: `ActorBroker.new(error_handler:)`
 
 Tagging note: a bare commit hash after `ultra` is read as a focus note, and a base with no shared history triggers a whole-repository cost confirmation that only an interactive terminal session can answer; the extension's command path cannot. `review-since-initial` (tag on `22a97a2`) is the fallback base that needs no confirmation. The note passed on the command line is never delivered to the cloud reviewers; put review guidance in a file in the diff instead.
 
-Whether the whole-repository reviewers used `docs/review-focus.md` is unclear: none of the findings cite its invariants by number, though finding 5 is invariant 9 in substance. The lock-ordering and settlement-race interleavings it lists have therefore not been explicitly confirmed by an independent reviewer; a targeted manual read of `actor_exited`/`actor_failed`/`settle_boot`/`settle_restart`/`relaunch`/`stop_subtrees` against `Reference#stop`/`actor_exited` is still worthwhile.
+Whether the whole-repository reviewers used `docs/review-focus.md` is unclear: none of the findings cite its invariants by number, though finding 5 is invariant 9 in substance.
+
+Targeted concurrency read (2026-09-22, by the author, invariant by invariant against `docs/review-focus.md`; not independent, recorded so the reasoning can be checked):
+
+- Lock ordering holds: every broker call into a `Reference` method that takes `@pending_mutex` (`ask`, `tell`, `stop`, `send_broker_response`, `attach_broker`) happens after the broker mutex is released, with the reference captured under the mutex; `Reference` never calls into the broker while holding `@pending_mutex` (`read_replies` reads `@broker` under the lock and dispatches outside it); every callback (`on_resolve`, `on_exit`, `on_done`) is invoked outside `@pending_mutex` and outside `Future`'s mutex.
+- Invariant 1 (one response, one release per request): each `dispatch` path ends in exactly one `respond`/`respond_error`; `release_once` guards the slot; a source that stops discards its control outbox exactly once (array swap under lock) and the writer's `ensure` covers the in-flight write.
+- Invariants 3–5 (boot settlement, stale exits, stop vs relaunch): both orderings of "reader rejects the boot future" and "reaper runs `actor_exited`" converge (`boot_exit` recorded during boot; `actor_failed` after settle); `relaunch` installs only under `:restarting` and kills the new process otherwise; `stop_subtrees` snapshots the reference at marking time; a `:restarting` node in backoff is stopped through its dead reference and the delayed relaunch finds it terminal.
+- Invariant 9 (anything an actor sends): a non-hash frame raises `TypeError` in `read_replies` and is now a protocol violation; a request without an integer `request_id` gets no response (the misbehaving actor's `call` blocks until it is stopped); floods are bounded by the per-source response slots, which block only that actor's reader.
+- Three changes came out of the read: `Reference#actor_exited` ran the broker's exit callbacks after `@socket.close` inside a `rescue IOError`, so a close error would have silenced the exit (callbacks now run unconditionally); failure-path subtree stops ran on the service thread and could delay route expiries by the kill grace per child (`stop_later` puts them on the lifecycle pool); `broker.stop` from a broker thread (an `error_handler`) joined its own thread (`ThreadError`; now skipped). Tests: `test_broker_stop_from_its_own_error_handler_does_not_deadlock`, `test_child_cleanup_after_a_failure_does_not_delay_route_expiries`.
+- Remaining review debt: this read is the author's. If an independent pass is wanted, `docs/review-focus.md` is the brief.
 
 Public surface (2026-09-22): `Reference`, `Transport`, `BrokerClient`, and `Runner` joined `Launcher` as `private_constant`s, so the API is exactly `ActorBroker`, `ActorHandle`, `ActorContext`, `Future`, `ExitStatus`, the errors, and the `RocotoActor` module functions (`context`, `worker_process?`, `broker_client`). Tests that exercise internals directly reach them with `RocotoActor.const_get(:Name)` (`test/transport_test.rb`, `test/rocoto_actor_test.rb`, `test/soak/soak.rb`, and one support actor). `Runner.run` is invoked from inside the module namespace at the end of `runner.rb` because the constant is private. `test_internals_are_not_public` asserts the split using `Module#constants`, which omits private constants.
 

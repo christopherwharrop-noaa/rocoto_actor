@@ -1,5 +1,8 @@
 # Review focus: concurrency in the broker and reference
 
+Status: traced by the author on 2026-09-22 (see "Targeted concurrency read" in
+`docs/actor-broker-handoff.md`); still open for an independent reviewer.
+
 This file exists to direct a code review. It describes the invariants the
 concurrency core is supposed to uphold and the specific interleavings that have
 not yet had an independent review. Findings that show one of these invariants

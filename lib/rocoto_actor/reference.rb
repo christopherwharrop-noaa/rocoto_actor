@@ -393,10 +393,13 @@ module RocotoActor
       # reader reaches EOF; let it consume the watchdog's exit report first.
       Launcher.signal_process_group(@pid, "KILL")
       join_reader
-      @socket.close unless @socket.closed?
+      begin
+        @socket.close unless @socket.closed?
+      rescue IOError
+        nil
+      end
+      # The broker learns of the exit here; nothing above may prevent it.
       callbacks.each(&:call)
-    rescue IOError
-      nil
     end
 
     def kill_deadline(deadline)

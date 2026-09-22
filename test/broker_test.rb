@@ -608,6 +608,32 @@ class ActorBrokerTest < Minitest::Test
     assert_equal "RocotoActor::SerializationError", error.remote_class
   end
 
+  def test_broker_stop_from_its_own_error_handler_does_not_deadlock
+    stopped = Queue.new
+    broker = RocotoActor::ActorBroker.new(error_handler: lambda { |_error, _context|
+      stopped << broker.stop(timeout: 2, force: true)
+    })
+    broker.spawn(ExampleActor, "x")
+    broker.send(:enqueue_task) { raise "boom" } # reported on the service thread, which then stops the broker
+
+    assert_equal true, stopped.pop(timeout: 5)
+    assert_empty broker.roots
+  end
+
+  def test_child_cleanup_after_a_failure_does_not_delay_route_expiries
+    target = @broker.spawn(ExampleActor, "target")
+    worker = @broker.spawn(ForwardingActor, target)
+    parent = @broker.spawn(InitSpawnActor, 1, 2, name: "parent")
+    parent.children.each { |child| child.ask(:hang) } # children will need a KILL and its confirmation grace
+
+    assert_raises(RocotoActor::ActorStoppedError) { parent.ask(:crash).value(timeout: 2) }
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    error = assert_raises(RocotoActor::RemoteError) { worker.ask(message: :hang, timeout: 0.1).value(timeout: 3) }
+
+    assert_equal "RocotoActor::AskTimeoutError", error.remote_class
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.6
+  end
+
   def test_service_thread_survives_a_failing_task_and_reports_it
     reported = []
     broker = RocotoActor::ActorBroker.new(error_handler: ->(error, context) { reported << [error.class, context] })

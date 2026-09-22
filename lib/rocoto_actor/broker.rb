@@ -136,7 +136,7 @@ module RocotoActor
         respond_error(source, request[:request_id], ActorStoppedError.new("actor broker is stopped"), release)
       end
       stopped = stop_subtrees(nodes, timeout: timeout, force: force)
-      threads.each(&:join)
+      threads.each { |thread| thread.join unless thread == Thread.current } # stop may be called from error_handler
       stopped
     end
 
@@ -346,11 +346,7 @@ module RocotoActor
 
       reference&.stop(force: true, timeout: 0)
       unregister(node)
-      unless children.empty?
-        enqueue_task do
-          stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true)
-        end
-      end
+      stop_later(children)
       Launcher.startup_error(reference, error)
     end
 
@@ -677,12 +673,16 @@ module RocotoActor
         end
         [delay, live]
       end
-      unless children.empty?
-        enqueue_task do
-          stop_subtrees(children, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true)
-        end
-      end
+      stop_later(children)
       enqueue_task(delay: delay) { enqueue_lifecycle_job { relaunch(node) } } if delay
+    end
+
+    # Force-stops nodes on the lifecycle pool: stopping waits on processes, and
+    # the service thread must stay free to run route expiries on time.
+    def stop_later(nodes)
+      return if nodes.empty?
+
+      enqueue_lifecycle_job { stop_subtrees(nodes, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) }
     end
 
     # Caller holds @mutex. Records a restart attempt and returns its backoff
