@@ -167,8 +167,8 @@ bundle exec ruby -Itest test/broker_test.rb
 Latest validation (2026-09-22):
 
 ```text
-broker: 62 runs, 267 assertions, 0 failures, 0 errors
-full suite: 98 runs, 340 assertions, 0 failures, 0 errors
+broker: 66 runs, 280 assertions, 0 failures, 0 errors
+full suite: 102 runs, 353 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -249,6 +249,15 @@ Documented, not fixed:
 
 7. While an actor is blocked in `BrokerClient#request` it reads and defers every incoming `:ask`/`:tell` without bound; the application-side mailbox limits bound only the unsent outbox, so a caller that floods an actor during its long `call` grows that actor's memory. Acceptable at the intended scale; a credit-based flow control or a bound that fails the call would be the fix if needed.
 8. Terminal nodes are retained forever and root spawns scan all nodes. Node metadata retention is accepted per the scale decision above; the soak showed each terminal node also pinned its `Reference` (thread stacks, closed socket) and `spec` (constructor arguments), so `retire(node, state)` now copies `exit_error`/`exit_status` onto the node and releases the reference and spec at every terminal transition. `ask`/`tell` and the boot settlers read the reference under the mutex because a concurrent `retire` can null it.
+
+A `/code-review ultra` pass (2026-09-22, standard diff review; the launch note asking for lock-ordering and settlement-race focus was recorded but not delivered to the reviewers) produced four findings, all fixed with tests:
+
+1. Exponential backoff defeated the restart cap: timestamps older than `restart_window` were pruned, and once a doubling delay exceeded the window the count could never reach `max_restarts`, so a persistently crashing actor restarted forever (defaults were safe; `restart_backoff: 1, max_restarts: 10` was not). `restart_delay` now counts consecutive failures and resets only when the previous incarnation ran for `restart_window` seconds (`node.started_at`, set when an incarnation becomes `:running`); time spent in backoff never counts. README wording updated.
+2. Internal relaunch jobs shared `@lifecycle_queue` and counted against `max_pending_lifecycle_requests`; the bound now counts only client requests.
+3. `report_failure`/`report_boot_error` dropped the report when the error itself could not be serialized (invalid UTF-8 in a message); `write_report` falls back to reporting the `SerializationError`, matching the ask path.
+4. A local named `roots` in `ActorBroker#stop` held every node; renamed `nodes`.
+
+The lock-ordering and settlement-race review the note asked for has therefore only had the `/code-review high` pass; a follow-up review with that focus, or a targeted manual read of `actor_exited`/`actor_failed`/`settle_boot`/`settle_restart`/`relaunch`/`stop_subtrees` against `Reference#stop`/`actor_exited`, is still worthwhile.
 
 Soak harness: `test/soak/soak.rb` (`SOAK_SECONDS=1800 bundle exec ruby -Ilib test/soak/soak.rb`) runs continuous ask/tell traffic with injected crashes, external kills, told-message exceptions, stops, and respawns; samples threads/fds/children/zombies/RSS/live heap slots and live `Reference`/`Future`/`ActorHandle` counts after `GC.start`; and fails on upward trends, a zombie persisting across consecutive samples, children surviving `broker.stop`, `broker.stop` returning false, or unexpected error classes. It logs any `Reference#stop` that returns false with its pid and elapsed time. It is not part of `rake test`.
 
@@ -351,6 +360,7 @@ Normal suite:
 - [x] tell: application tell ordered with asks and without sender; actor fan-out with tell and reply via `context.sender`; routed ask carries sender; tell then call from one actor arrive in order; tell to stopped target rejected for application and actors; exception in told message fails the actor and is recorded in `last_failure`; exception in told message triggers restart policy
 - [x] `ask` inside an actor raises with guidance
 - [x] actor killed from outside (SIGKILL to the worker) is restarted under `:on_failure` and fails under the default policy; the per-actor watchdog process holds no policy
+- [x] backoff longer than the window cannot defeat `max_restarts`; healthy uptime resets the count; relaunch jobs do not consume the lifecycle request budget; unserializable crash messages are still reported
 - [x] exit reasons: `last_exit` reports termsig for SIGKILL and SIGTERM, exitstatus for `exit!` and told-message exceptions (with `last_failure`), nil while running and after stop, retained across restart
 - [x] restart: same handle and path with new generation; restarted actor recreates children; requests during restart fail fast locally and via broker; restart limit leaves `:failed`; stop during backoff cancels relaunch; policy from `context.spawn`; policy validation; default policy does not restart
 - [x] malformed broker requests fail closed (invalid timeout)

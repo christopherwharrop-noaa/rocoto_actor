@@ -111,13 +111,25 @@ module RocotoActor
     private_class_method :deliver
 
     def report_failure(socket, error)
-      response = error_response(nil, error)
-      response.delete(:id)
-      Transport.write(socket, response.merge(op: :actor_error))
-    rescue IOError, SystemCallError, SerializationError
-      nil
+      write_report(socket, error) { |reported| error_response(nil, reported).tap { |r| r.delete(:id) }.merge(op: :actor_error) }
     end
     private_class_method :report_failure
+
+    # Writes the report built by the block; if the error itself cannot be
+    # serialized (for example a message with invalid UTF-8), reports that
+    # SerializationError instead so the parent still learns why the actor died.
+    def write_report(socket, error)
+      Transport.write(socket, yield(error))
+    rescue SerializationError => serialization_error
+      begin
+        Transport.write(socket, yield(serialization_error))
+      rescue IOError, SystemCallError, SerializationError
+        nil
+      end
+    rescue IOError, SystemCallError
+      nil
+    end
+    private_class_method :write_report
 
     # A RemoteError crossing another actor boundary keeps its original class,
     # message, and backtrace rather than nesting a RemoteError per hop.
@@ -178,11 +190,11 @@ module RocotoActor
     def report_boot_error(socket, error, boot_id = nil)
       return unless socket && !socket.closed?
 
-      response = error_response(boot_id, error)
-      response[:op] = :boot_error unless boot_id
-      Transport.write(socket, response)
-    rescue IOError, SystemCallError, SerializationError
-      nil
+      write_report(socket, error) do |reported|
+        response = error_response(boot_id, reported)
+        response[:op] = :boot_error unless boot_id
+        response
+      end
     end
     private_class_method :report_boot_error
   end

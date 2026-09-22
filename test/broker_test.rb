@@ -512,6 +512,65 @@ class ActorBrokerTest < Minitest::Test
     assert_equal "slow: later", caller.ask("later").value(timeout: 2)
   end
 
+  def test_backoff_longer_than_the_window_cannot_defeat_the_restart_limit
+    # Backoff delays (0.3s, 0.6s) exceed the window (0.5s); under timestamp
+    # pruning the count would never reach max_restarts.
+    actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 2,
+                                                       restart_window: 0.5, restart_backoff: 0.3)
+
+    3.times do |attempt|
+      assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+      wait_until(timeout: 5) do
+        actor.state == :failed || (actor.state == :running && actor.generation == attempt + 2)
+      end
+    end
+
+    assert_equal :failed, actor.state
+    assert_equal 3, actor.generation
+  end
+
+  def test_healthy_uptime_resets_the_restart_count
+    actor = @broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 1,
+                                                       restart_window: 0.2, restart_backoff: 0.01)
+
+    assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+    wait_until { actor.state == :running && actor.generation == 2 }
+    sleep 0.4 # a full window of healthy running resets the count
+    assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+    wait_until { actor.state == :running && actor.generation == 3 }
+
+    assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+    wait_until { actor.state == :failed }
+    assert_equal 3, actor.generation
+  end
+
+  def test_relaunch_jobs_do_not_consume_the_lifecycle_request_budget
+    broker = RocotoActor::ActorBroker.new(max_lifecycle_workers: 1, max_pending_lifecycle_requests: 1)
+    supervisor = broker.spawn(SupervisorActor, name: "sup")
+    crashers = Array.new(3) do |index|
+      broker.spawn(ExampleActor, "c", name: "c#{index}", restart: :on_failure, restart_backoff: 0.3)
+    end
+    crashers.each { |crasher| crasher.ask(:crash).value(timeout: 2) rescue nil }
+    wait_until { crashers.all? { |crasher| crasher.state == :restarting } }
+
+    child = supervisor.ask(op: :spawn, name: "child", arguments: ["ok"]).value(timeout: 5)
+
+    assert_equal "ok: hi", child.ask("hi").value(timeout: 2)
+  ensure
+    broker&.stop(timeout: 2, force: true)
+  end
+
+  def test_unserializable_crash_messages_are_still_reported
+    collector = @broker.spawn(CollectorActor, name: "collector")
+    collector.tell(op: :binary_boom)
+    wait_until { collector.state == :failed && collector.last_failure }
+
+    assert_equal "RocotoActor::SerializationError", collector.last_failure.remote_class
+
+    error = assert_raises(RocotoActor::RemoteError) { @database.ask(:binary_boom).value(timeout: 2) }
+    assert_equal "RocotoActor::SerializationError", error.remote_class
+  end
+
   def test_restart_limit_marks_the_actor_failed
     actor = @broker.spawn(ExampleActor, "flaky", name: "flaky", restart: :on_failure, max_restarts: 2,
                                                                   restart_backoff: 0.01)

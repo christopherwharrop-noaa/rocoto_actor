@@ -28,7 +28,7 @@ module RocotoActor
     # spawn children from initialize; a failed boot unregisters it. spec holds
     # what is needed to relaunch the actor; restarts records recent restart times.
     Node = Struct.new(:id, :name, :path, :generation, :parent_id, :children, :state, :reference, :booting,
-                      :spec, :policy, :restarts, :failure, :exit, :boot_exit) do
+                      :spec, :policy, :restarts, :failure, :exit, :boot_exit, :started_at) do
       def terminal?
         TERMINAL_STATES.include?(state)
       end
@@ -111,7 +111,7 @@ module RocotoActor
     end
 
     def stop(timeout: Reference::DEFAULT_STOP_TIMEOUT, force: false)
-      roots, threads, abandoned = @mutex.synchronize do
+      nodes, threads, abandoned = @mutex.synchronize do
         @stopped = true
         @capacity_condition.broadcast
         @service_condition.broadcast
@@ -126,7 +126,7 @@ module RocotoActor
         source, request, release = job
         respond_error(source, request[:request_id], ActorStoppedError.new("actor broker is stopped"), release)
       end
-      stopped = stop_subtrees(roots, timeout: timeout, force: force)
+      stopped = stop_subtrees(nodes, timeout: timeout, force: force)
       threads.each(&:join)
       stopped
     end
@@ -317,7 +317,10 @@ module RocotoActor
         if error
           [node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, node.reference]
         else
-          node.state = :running if node.state == :starting
+          if node.state == :starting
+            node.state = :running
+            node.started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          end
           [[], node.boot_exit.equal?(node.reference), nil]
         end
       end
@@ -365,7 +368,7 @@ module RocotoActor
     def enqueue_lifecycle(source, request, release_response)
       rejection = @mutex.synchronize do
         next ActorStoppedError.new("actor broker is stopped") if @stopped
-        if @lifecycle_queue.size >= @max_pending_lifecycle_requests
+        if @lifecycle_queue.count { |job| job.is_a?(Array) } >= @max_pending_lifecycle_requests
           next BrokerBusyError.new("actor broker has #{@max_pending_lifecycle_requests} lifecycle requests waiting")
         end
 
@@ -522,7 +525,7 @@ module RocotoActor
         parent = check_placement(parent_id, name)
         name ||= id
         path = parent ? "#{parent.path}/#{name}" : name
-        node = Node.new(id, name, path, 1, parent_id, [], :starting, reference, true, spec, policy, [])
+        node = Node.new(id, name, path, 1, parent_id, [], :starting, reference, true, spec, policy, 0)
         @nodes[id] = node
         @node_ids_by_reference[reference] = id
         parent&.children&.push(id)
@@ -548,7 +551,7 @@ module RocotoActor
       @node_ids_by_reference.delete(reference)
       node.reference = nil
       node.spec = nil
-      node.restarts = []
+      node.restarts = 0
     end
 
     # Caller holds @mutex. Returns the node only when it accepts messages.
@@ -634,16 +637,20 @@ module RocotoActor
     end
 
     # Caller holds @mutex. Records a restart attempt and returns its backoff
-    # delay, or nil when the policy forbids restarting now.
+    # delay, or nil when the policy forbids restarting now. The count is of
+    # consecutive failures and resets only after the actor has run for
+    # restart_window seconds, so backoff delays (time not running) can never
+    # prune failures out of the window and defeat max_restarts.
     def restart_delay(node)
       return nil if @stopped || node.policy[:restart] == :never
 
       now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      node.restarts.reject! { |time| now - time > node.policy[:restart_window] }
-      return nil if node.restarts.size >= node.policy[:max_restarts]
+      node.restarts = 0 if node.started_at && now - node.started_at > node.policy[:restart_window]
+      node.started_at = nil
+      return nil if node.restarts >= node.policy[:max_restarts]
 
-      node.restarts << now
-      node.policy[:restart_backoff] * (2**(node.restarts.size - 1))
+      node.restarts += 1
+      node.policy[:restart_backoff] * (2**(node.restarts - 1))
     end
 
     # Runs on a lifecycle thread. Replaces the node's dead reference with a new
@@ -688,7 +695,10 @@ module RocotoActor
         next [false, false, nil] unless node.booting
 
         node.booting = false
-        node.state = :running if node.state == :restarting && error.nil?
+        if node.state == :restarting && error.nil?
+          node.state = :running
+          node.started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        end
         [!error.nil?, error.nil? && node.boot_exit.equal?(node.reference), node.reference]
       end
       return actor_failed(node) if exited

@@ -14,6 +14,7 @@ class CollectorActor
     when :record then @messages << [message[:value], RocotoActor.context.sender&.id]
     when :ping then RocotoActor.context.sender.tell(op: :pong, from: RocotoActor.context.handle)
     when :boom then raise "told to fail"
+    when :binary_boom then raise "bad input: \xFF".b
     when :tell_then_call
       target = message.fetch(:target)
       target.tell(op: :record, value: :told)
