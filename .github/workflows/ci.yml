@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       soak_seconds:
-        description: "Run the soak harness for this many seconds (0 skips it)"
+        description: "Run the soak harness for this many seconds (0 skips it; at most 20000, see timeout-minutes)"
         default: "0"
 
 jobs:
@@ -48,4 +48,6 @@ jobs:
         run: bundle exec ruby -Ilib test/soak/soak.rb
         env:
           SOAK_SECONDS: ${{ github.event.inputs.soak_seconds }}
-        timeout-minutes: 120
+        # Expressions cannot derive this from soak_seconds; keep it above the
+        # longest soak plus setup. Hosted runners cap a job at 360 minutes.
+        timeout-minutes: 350
