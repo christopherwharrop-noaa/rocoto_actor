@@ -150,6 +150,30 @@ During `receive`, `RocotoActor.context.sender` is the handle of the actor that s
 
 Because no reply can carry an exception, an unhandled exception while processing a told message ends the actor: the process exits, the broker records the error as `handle.last_failure` (a `RemoteError`), and the restart policy decides what happens next. Whatever ends an actor's process on its own, the watchdog reports how: `handle.last_exit` is a `RocotoActor::ExitStatus` with `exitstatus` or `termsig` (`signaled?`, and `to_s` such as `killed by signal 9 (KILL)`), retained across a restart. It is `nil` while the actor runs and after an orderly `stop`. A signal delivered to the worker ends it by that signal, so an OOM kill or an external `TERM` is reported as such rather than masked as a normal exit. With the default policy the actor stays `:failed`; with `restart: :on_failure` it is relaunched and later tells are processed by the new incarnation. Messages that were in its mailbox are not replayed.
 
+### Scheduling messages to yourself
+
+An actor only acts when it receives a message, so periodic or deferred work needs a message that arrives later. `RocotoActor.context.schedule` sends a `tell` from the actor to itself after a delay, at an interval, or both:
+
+```ruby
+class PollerActor
+  def initialize(source)
+    @source = source
+    @poll = RocotoActor.context.schedule({ op: :poll }, every: 30)
+    RocotoActor.context.schedule({ op: :warm_up }, after: 1)
+  end
+
+  def receive(message)
+    case message[:op]
+    when :poll then check(@source)
+    when :warm_up then prepare
+    when :stop_polling then @poll.cancel
+    end
+  end
+end
+```
+
+`schedule` returns a `RocotoActor::Timer`; `cancel` returns `true` if the timer was still scheduled. The scheduled message arrives like any other tell, with `RocotoActor.context.sender` equal to the actor's own handle. A recurring timer re-arms after each delivery (fixed delay), so a slow actor never accumulates a burst. Timers are owned by the broker and by the incarnation that created them: they are dropped when the actor stops, fails, or is restarted, and a restarted actor schedules afresh in `initialize`, just as it recreates its children. A tick that cannot be placed in the mailbox is dropped and passed to the broker's `error_handler`; a recurring timer keeps going. A tick already in the mailbox when `cancel` is called is still delivered. Only the creating actor can cancel a timer; an actor has at most 100 timers and an interval is at least 10 ms.
+
 ### Restart policies
 
 By default a crashed actor stays `:failed`; nothing is restarted or retried on the application's behalf, because a brokered call is at-most-once and the crash may have happened after a non-idempotent effect. Opt in per actor:

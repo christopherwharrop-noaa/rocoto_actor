@@ -69,6 +69,7 @@ module RocotoActor
         ["float", value]
       when Symbol then ["symbol", value.to_s]
       when ActorHandle then ["actor_handle", value.id]
+      when Timer then ["timer", value.id]
       when Array
         encode_container(value, seen) do
           ["array", value.map { |item| encode(item, seen, depth + 1) }]
@@ -108,6 +109,8 @@ module RocotoActor
         else
           ActorHandle.new(payload, broker: Thread.current[:rocoto_actor_broker])
         end
+      when "timer"
+        Timer.new(payload, socket: RocotoActor.worker_process? ? Thread.current[:rocoto_actor_transport_socket] : nil)
       when "array" then payload.map { |item| decode(item) }
       when "hash"
         payload.to_h { |key, item| [decode(key), decode(item)] }

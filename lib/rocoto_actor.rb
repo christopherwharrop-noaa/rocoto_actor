@@ -6,6 +6,7 @@ require "rbconfig"
 require_relative "rocoto_actor/version"
 require_relative "rocoto_actor/errors"
 require_relative "rocoto_actor/handle"
+require_relative "rocoto_actor/timer"
 require_relative "rocoto_actor/broker_client"
 require_relative "rocoto_actor/context"
 require_relative "rocoto_actor/transport"
@@ -17,8 +18,8 @@ require_relative "rocoto_actor/broker"
 # Actors are created only through RocotoActor::ActorBroker in the application
 # process, or through RocotoActor.context inside an actor.
 #
-# Public API: ActorBroker, ActorHandle, ActorContext, Future, ExitStatus, the
-# error classes, and the module functions below. Reference, Transport,
+# Public API: ActorBroker, ActorHandle, ActorContext, Timer, Future, ExitStatus,
+# the error classes, and the module functions below. Reference, Transport,
 # BrokerClient, Launcher, and Runner are private constants.
 module RocotoActor
   PARENT_CHECK_INTERVAL = 0.1

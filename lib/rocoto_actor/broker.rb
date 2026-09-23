@@ -9,7 +9,9 @@ module RocotoActor
     DEFAULT_ROUTE_TIMEOUT = 30
     DEFAULT_MAX_LIFECYCLE_WORKERS = 2
     DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS = 100
-    REQUEST_OPS = %i[broker_request broker_tell broker_spawn broker_stop].freeze
+    REQUEST_OPS = %i[broker_request broker_tell broker_spawn broker_stop broker_schedule broker_cancel].freeze
+    MAX_TIMERS_PER_ACTOR = 100
+    MIN_TIMER_INTERVAL = 0.01
     SPAWN_OPTIONS = ActorContext::SPAWN_OPTIONS
     STATES = %i[starting running restarting stopping stopped failed].freeze
     TERMINAL_STATES = %i[stopped failed].freeze
@@ -24,6 +26,8 @@ module RocotoActor
     DEFAULT_ERROR_HANDLER = lambda do |error, context|
       warn "rocoto_actor: #{context}: #{error.class}: #{error.message}"
     end
+
+    TimerRecord = Struct.new(:id, :node_id, :generation, :message, :every)
 
     # Logical lifecycle record for one brokered actor. Every actor process is a
     # direct child of the application; parent/child structure exists only here.
@@ -74,6 +78,7 @@ module RocotoActor
       @idle_lifecycle_workers = 0
       @lifecycle_condition = ConditionVariable.new
       @node_ids_by_reference = {}.compare_by_identity
+      @timers = {} # id => TimerRecord; an actor's timers die with its incarnation
       @mutex = Mutex.new
       @capacity_condition = ConditionVariable.new
       @nodes = {}
@@ -219,6 +224,8 @@ module RocotoActor
       case request[:op]
       when :broker_request then route(source, request, release_response)
       when :broker_tell then relay_tell(source, request, release_response)
+      when :broker_schedule then schedule_timer(source, request, release_response)
+      when :broker_cancel then cancel_timer(source, request, release_response)
       when :broker_spawn, :broker_stop then enqueue_lifecycle(source, request, release_response)
       else respond_error(source, request_id, Error.new("unknown broker operation"), release_response)
       end
@@ -242,6 +249,82 @@ module RocotoActor
       respond(source, request[:request_id], nil, release_response)
     rescue StandardError => error
       respond_error(source, request[:request_id], error, release_response)
+    end
+
+    # Registers a self-addressed timer for the requesting actor and answers
+    # with its Timer. Runs inline on the reader thread; never waits.
+    def schedule_timer(source, request, release_response)
+      after = request[:after]
+      every = request[:every]
+      raise ArgumentError, "schedule needs after: or every:" if after.nil? && every.nil?
+      raise ArgumentError, "after must be a non-negative number" unless after.nil? || non_negative_number?(after)
+      unless every.nil? || (valid_timeout?(every) && every >= MIN_TIMER_INTERVAL)
+        raise ArgumentError, "every must be at least #{MIN_TIMER_INTERVAL} seconds"
+      end
+
+      timer = @mutex.synchronize do
+        node = source_node(source)
+        if @timers.count { |_id, record| record.node_id == node.id } >= MAX_TIMERS_PER_ACTOR
+          raise Error, "actor #{node.path} already has #{MAX_TIMERS_PER_ACTOR} timers"
+        end
+
+        record = TimerRecord.new(SecureRandom.hex(16), node.id, node.generation, request[:message], every)
+        @timers[record.id] = record
+        record
+      end
+      enqueue_task(delay: after || every) { fire_timer(timer.id) }
+      respond(source, request[:request_id], Timer.new(timer.id), release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    def cancel_timer(source, request, release_response)
+      cancelled = @mutex.synchronize do
+        node = @nodes[@node_ids_by_reference[source]]
+        record = @timers[request[:timer_id]]
+        next false unless node && record && record.node_id == node.id
+
+        !@timers.delete(record.id).nil?
+      end
+      respond(source, request[:request_id], cancelled, release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    # Runs on the service thread. Delivers the timer's message as a tell from
+    # the actor to itself, then re-arms a recurring timer. A timer whose actor
+    # incarnation is gone has already been purged; a tell that fails is
+    # reported and, for a recurring timer, tried again next interval.
+    def fire_timer(id)
+      record, reference, sender = @mutex.synchronize do
+        record = @timers[id]
+        next [nil, nil, nil] unless record
+
+        node = @nodes[record.node_id]
+        unless node && node.generation == record.generation && node.active?
+          @timers.delete(id)
+          next [nil, nil, nil]
+        end
+        @timers.delete(id) unless record.every
+        [record, node.reference, ActorHandle.new(node.id, broker: self)]
+      end
+      return unless record
+
+      begin
+        reference.tell(record.message, sender)
+      rescue StandardError => error
+        report_error(error, "scheduled tell to #{sender.id}")
+      end
+      enqueue_task(delay: record.every) { fire_timer(id) } if record.every
+    end
+
+    # Caller holds @mutex. Drops every timer of the node's current incarnation.
+    def purge_timers(node)
+      @timers.delete_if { |_id, record| record.node_id == node.id }
+    end
+
+    def non_negative_number?(value)
+      value.is_a?(Numeric) && value >= 0 && value.to_f.finite?
     end
 
     # Caller holds @mutex. The handle of the actor behind a source reference.
@@ -584,6 +667,7 @@ module RocotoActor
     # spec. The node itself stays so its handle keeps answering with its state.
     def retire(node, state)
       node.state = state
+      purge_timers(node)
       reference = node.reference
       return unless reference
 
@@ -666,6 +750,7 @@ module RocotoActor
         live_postorder(node).each { |descendant| descendant.state = :stopping unless descendant.equal?(node) }
         live = node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
         delay = restart_delay(node)
+        purge_timers(node)
         if delay
           node.state = :restarting
         else

@@ -84,7 +84,8 @@ The long-term preferred API is asynchronous `handle.ask`, returning a future tha
 - `lib/rocoto_actor/broker.rb`: `ActorBroker` registry and lifecycle nodes, bounded non-blocking routing, the service thread (route expiries and failure cleanup), and the lifecycle pool for actor-initiated spawn/stop.
 - `lib/rocoto_actor/handle.rb`: `ActorHandle`; in the application it delegates to the broker, in an actor it sends requests through `BrokerClient`.
 - `lib/rocoto_actor/broker_client.rb`: worker-side per-socket request channel with unique request IDs and deferred frames.
-- `lib/rocoto_actor/context.rb`: `ActorContext`, exposed as `RocotoActor.context` inside an actor (`spawn`, `handle`).
+- `lib/rocoto_actor/context.rb`: `ActorContext`, exposed as `RocotoActor.context` inside an actor (`spawn`, `handle`, `schedule`).
+- `lib/rocoto_actor/timer.rb`: `Timer`, the cancellable result of `context.schedule`.
 - `lib/rocoto_actor.rb`: loads the library and holds worker-side accessors (`worker_process?`, `context`, `broker_client`); no public spawn.
 - `lib/rocoto_actor/launcher.rb`: internal (`private_constant`) process launcher (`launch` returns `[reference, boot_future]`), startup error mapping, and process-group helpers used by `ActorBroker` and `Reference`.
 - `lib/rocoto_actor/runner.rb`: worker entry point; marks the worker process, builds the context from the boot message, marks the broker client ready after `:ready`, and runs the actor loop (`run_actor` drains deferred frames and flattens `RemoteError` provenance in `error_response`).
@@ -156,6 +157,7 @@ Implementation progress:
 - [x] Add logical parent/child lifecycle metadata (`ActorBroker::Node`: id, name, path, generation, parent_id, children, state, reference; `spawn(parent:, name:)`; recursive stop; failure propagation; `ActorFailedError`).
 - [x] Add broker-owned child spawning (`RocotoActor.context.spawn`, `:broker_spawn`/`:broker_stop`, bounded lifecycle pool, per-socket `BrokerClient` with unique request IDs).
 - [x] Add `tell` (one-way messages, broker-acked enqueue, sender handle in the envelope, `context.sender`, failure on unhandled exception with `handle.last_failure`).
+- [x] Add self-scheduled tells (`context.schedule(message, after:, every:)` → `Timer#cancel`; broker-owned timers that die with the incarnation; undeliverable ticks dropped and reported).
 - [x] Add restart policies and generations (`restart: :never | :on_failure`, `max_restarts`, `restart_window`, `restart_backoff`; `:restarting` state; `ActorRestartingError`; `handle.generation`).
 
 The broker-focused command was run:
@@ -164,11 +166,11 @@ The broker-focused command was run:
 bundle exec ruby -Itest test/broker_test.rb
 ```
 
-Latest validation (2026-09-22):
+Latest validation (2026-09-23):
 
 ```text
-broker: 73 runs, 336 assertions, 0 failures, 0 errors
-full suite: 110 runs, 412 assertions, 0 failures, 0 errors
+broker: 80 runs, 365 assertions, 0 failures, 0 errors
+full suite: 117 runs, 441 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -220,6 +222,14 @@ Remove generated `Gemfile.lock` if it is untracked and was created only by local
 - Worker side: `handle.tell` sends `:broker_tell`; `ActorBroker#relay_tell` runs inline on the source's reader thread (no route slot; it never waits on the target), enqueues with `sender: sender_handle(source)`, and acks with `ok: true, result: nil` or a typed error. Routed asks now also carry the sender.
 - Failure: `Runner.run_actor` rescues an exception from a told `receive`, writes `{ op: :actor_error, error_class:, message:, backtrace: }`, and exits; `Reference` stores it as `exit_error`, `ActorBroker#last_failure` returns `node.failure || reference.exit_error`, and `relaunch` copies the previous reference's `exit_error` into `node.failure` before swapping. The exit then follows the normal failure path (`actor_failed`, restart policy).
 - Idempotency keys were deliberately left as an application pattern (dedup must live in the receiver, atomically with the effect); no envelope slot was added. Worker-side async `ask` was rejected: a future waited on inside `receive` either blocks or delivers results outside the message flow. `tell` plus reply-as-message is the async model.
+
+### Timer design (implemented, 2026-09-23)
+
+- Scope decided with the user: only an actor schedules messages, and only to itself; the application does its own scheduling. No retry of an undeliverable tick. `Timer#cancel` is the whole timer API.
+- `ActorContext#schedule` sends `:broker_schedule { message, after, every }`; the broker (`schedule_timer`, inline on the reader thread) validates (`after` ≥ 0, `every` ≥ `MIN_TIMER_INTERVAL` 0.01 s, at most `MAX_TIMERS_PER_ACTOR` 100 per actor), records a `TimerRecord { id, node_id, generation, message, every }`, arms it with `enqueue_task(delay:)`, and answers with a `Timer` (encoded `["timer", id]`; decoded socket-bound in a worker, unbound in the application where `cancel` raises).
+- `fire_timer` on the service thread re-checks the record and that the node is the same generation and active, tells the message with the actor's own handle as sender, reports a failing tell to `error_handler` ("scheduled tell to <id>"), and re-arms a recurring timer with fixed delay. A timer whose incarnation is gone is dropped at the check; `purge_timers` also runs in `retire` and in `actor_failed`, so nothing fires into a restarting or terminal node.
+- `:broker_cancel` succeeds only for the requesting actor's own timer. A cancelled recurring timer's already-armed task fires into a missing record and is a no-op; tasks are therefore bounded by the number of timers ever armed plus one per recurrence, never accumulating.
+- Test support: `test/support/ticker_actor.rb`. Tests cover one-shot with sender, recurring until cancel, cancel before fire, timers dying with the incarnation while `initialize` reschedules, undeliverable ticks reported with recurrence continuing, validation and bounds, and a `Timer` returned to the application refusing `cancel`.
 
 ### Restart design (implemented)
 

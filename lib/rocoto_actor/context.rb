@@ -19,6 +19,16 @@ module RocotoActor
       @handle = actor_id && ActorHandle.new(actor_id, socket: socket)
     end
 
+    # Schedules a tell from this actor to itself: once after `after:` seconds,
+    # or every `every:` seconds (starting after `after:` when both are given).
+    # The message arrives in receive with sender == handle. The timer dies with
+    # this incarnation of the actor; a restarted actor schedules afresh in
+    # initialize. A tick that cannot be delivered is dropped and reported to the
+    # broker's error_handler.
+    def schedule(message, after: nil, every: nil)
+      @client.request(op: :broker_schedule, message: message, after: after, every: every)
+    end
+
     # Asks the broker to spawn a logical child of this actor and returns its
     # handle. The child process is owned by the application like any other.
     def spawn(actor_class, *arguments, name: nil, source: nil, **options)
