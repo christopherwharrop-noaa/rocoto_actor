@@ -6,9 +6,13 @@ require_relative "support/example_actor"
 require_relative "support/process_actor"
 require "tmpdir"
 
+# Exercises the internal process launcher and Reference directly; applications
+# go through RocotoActor::ActorBroker.
 class RocotoActorTest < Minitest::Test
+  LAUNCHER = RocotoActor.const_get(:Launcher)
+
   def setup
-    @actor = RocotoActor.spawn(ExampleActor, "reply")
+    @actor = LAUNCHER.spawn(ExampleActor, "reply")
   end
 
   def teardown
@@ -32,7 +36,7 @@ class RocotoActorTest < Minitest::Test
 
   def test_actor_startup_errors_are_reported_to_the_parent
     error = assert_raises(RocotoActor::RemoteError) do
-      RocotoActor.spawn(ExampleActor, :fail_boot)
+      LAUNCHER.spawn(ExampleActor, :fail_boot)
     end
 
     assert_equal "ArgumentError", error.remote_class
@@ -41,7 +45,7 @@ class RocotoActorTest < Minitest::Test
 
   def test_spawn_rejects_an_unloadable_source
     error = assert_raises(RocotoActor::RemoteError) do
-      RocotoActor.spawn(ExampleActor, source: File.join(Dir.tmpdir, "missing-rocoto-actor.rb"))
+      LAUNCHER.spawn(ExampleActor, source: File.join(Dir.tmpdir, "missing-rocoto-actor.rb"))
     end
 
     assert_equal "LoadError", error.remote_class
@@ -49,7 +53,7 @@ class RocotoActorTest < Minitest::Test
 
   def test_spawn_rejects_unsupported_constructor_arguments
     assert_raises(RocotoActor::SerializationError) do
-      RocotoActor.spawn(ExampleActor, Object.new)
+      LAUNCHER.spawn(ExampleActor, Object.new)
     end
   end
 
@@ -119,7 +123,7 @@ class RocotoActorTest < Minitest::Test
   end
 
   def test_full_mailbox_rejects_instead_of_blocking
-    actor = RocotoActor.spawn(ExampleActor, "reply", mailbox_size: 1)
+    actor = LAUNCHER.spawn(ExampleActor, "reply", mailbox_size: 1)
     actor.ask(:hang)
     sleep 0.05
     actor.ask("x" * (8 * 1024 * 1024))
@@ -132,7 +136,7 @@ class RocotoActorTest < Minitest::Test
   end
 
   def test_mailbox_enforces_byte_limit
-    actor = RocotoActor.spawn(ExampleActor, "reply", mailbox_bytes: 1_024)
+    actor = LAUNCHER.spawn(ExampleActor, "reply", mailbox_bytes: 1_024)
 
     assert_raises(RocotoActor::MailboxFullError) { actor.ask("x" * 1_024) }
   ensure
@@ -176,6 +180,19 @@ class RocotoActorTest < Minitest::Test
     assert_raises(RocotoActor::ActorStoppedError) { @actor.ask("too late") }
   end
 
+  def test_stop_confirms_a_kill_that_lands_after_the_deadline
+    pid = @actor.ask(:pid).value(timeout: 2)
+    Process.kill("STOP", pid) # unresponsive to the stop message, but KILL still applies
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    stopped = @actor.stop(timeout: 0.05)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+    assert stopped, "stop reported false although the KILL removed the group"
+    assert_operator elapsed, :<, 1
+    refute @actor.alive?
+  end
+
   def test_graceful_stop_forces_actor_after_timeout
     pending = @actor.ask(:hang)
 
@@ -207,7 +224,7 @@ class RocotoActorTest < Minitest::Test
   def test_forceful_stop_terminates_actor_descendants
     Dir.mktmpdir do |directory|
       pid_file = File.join(directory, "child.pid")
-      actor = RocotoActor.spawn(ProcessActor, pid_file)
+      actor = LAUNCHER.spawn(ProcessActor, pid_file)
       actor.ask(seconds: 30)
       child_pid = wait_for_pid(pid_file)
 
@@ -223,7 +240,7 @@ class RocotoActorTest < Minitest::Test
   def test_worker_exit_rejects_future_and_terminates_inherited_socket_holder
     Dir.mktmpdir do |directory|
       pid_file = File.join(directory, "child.pid")
-      actor = RocotoActor.spawn(ForkThenExitActor, pid_file)
+      actor = LAUNCHER.spawn(ForkThenExitActor, pid_file)
       pending = actor.ask(:go)
       child_pid = wait_for_pid(pid_file)
 
@@ -241,7 +258,7 @@ class RocotoActorTest < Minitest::Test
       reader, writer = IO.pipe
       owner_pid = fork do
         reader.close
-        actor = RocotoActor.spawn(BackgroundActor, pid_file)
+        actor = LAUNCHER.spawn(BackgroundActor, pid_file)
         actor.ask(:go).value(timeout: 1)
         writer.puts(actor.pid)
         writer.close
@@ -252,7 +269,7 @@ class RocotoActorTest < Minitest::Test
       child_pid = wait_for_pid(pid_file)
       Process.wait(owner_pid)
 
-      assert process_exits?(actor_pid, timeout: 2), "actor supervisor #{actor_pid} survived"
+      assert process_exits?(actor_pid, timeout: 2), "actor watchdog #{actor_pid} survived"
       assert process_exits?(child_pid, timeout: 2), "actor descendant #{child_pid} survived"
     ensure
       reader&.close
@@ -265,7 +282,7 @@ class RocotoActorTest < Minitest::Test
     started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
     assert_raises(RocotoActor::Error) do
-      RocotoActor.spawn(StubbornBootActor, start_timeout: 0.05)
+      LAUNCHER.spawn(StubbornBootActor, start_timeout: 0.05)
     end
 
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
@@ -276,7 +293,7 @@ class RocotoActorTest < Minitest::Test
     reader, writer = IO.pipe
     owner_pid = fork do
       reader.close
-      actor = RocotoActor.spawn(ExampleActor, "orphan")
+      actor = LAUNCHER.spawn(ExampleActor, "orphan")
       socket_holder_pid = fork { sleep 10 }
       writer.puts("#{actor.pid} #{socket_holder_pid}")
       writer.close

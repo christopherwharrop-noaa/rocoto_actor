@@ -49,13 +49,24 @@ class BackgroundActor
   end
 end
 
+# Returns a strictly increasing sequence number per message received.
+class CountingActor
+  def initialize
+    @count = 0
+  end
+
+  def receive(_message)
+    @count += 1
+  end
+end
+
 class ForwardingActor
   def initialize(target)
     @target = target
   end
 
   def receive(message)
-    if message.is_a?(Hash) && message[:timeout]
+    if message.is_a?(Hash) && message.key?(:timeout)
       @target.call(message[:message], timeout: message[:timeout])
     else
       @target.call(message, timeout: 1)
