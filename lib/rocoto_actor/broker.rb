@@ -79,6 +79,8 @@ module RocotoActor
       @error_handler = error_handler
       @on_event = on_event
       @watchers = {} # watched node id => { watcher node id => true }
+      @events = Queue.new # delivered in order on one thread that never runs anything else
+      @event_thread = nil
       @waiting = {} # node id => id of the node it is blocked on (a call or a child's boot)
       @lifecycle_queue = [] # [source, request, release_response] or an internal callable
       @lifecycle_workers = []
@@ -152,7 +154,8 @@ module RocotoActor
         @lifecycle_condition.broadcast
         queued = @lifecycle_queue
         @lifecycle_queue = []
-        [@nodes.values, [@service, *@lifecycle_workers].compact, queued]
+        @events.close
+        [@nodes.values, [@service, @event_thread, *@lifecycle_workers].compact, queued]
       end
       abandoned.each do |job|
         next unless job.is_a?(Array)
@@ -281,7 +284,7 @@ module RocotoActor
         watched = @nodes[request[:handle_id]] or raise Error, "unknown actor handle"
         if watched.terminal?
           detail = { reason: watched.failure&.message || watched.exit&.to_s, generation: watched.generation }
-          push_task_locked { deliver_event(watched.id, watched.state, detail, [watcher.id]) }
+          queue_event(watched.id, watched.state, detail, [watcher.id], notify_application: false)
         else
           (@watchers[watched.id] ||= {})[watcher.id] = true
         end
@@ -303,12 +306,29 @@ module RocotoActor
 
     # Caller holds @mutex. Queues delivery of a lifecycle event to the
     # application's on_event and to every watcher; a terminal event ends the
-    # watches. Delivery runs on the service thread, outside every lock.
+    # watches. Delivery runs on the event thread, outside every lock.
     def emit(node, event, reason)
       watcher_ids = @watchers.fetch(node.id, {}).keys
       @watchers.delete(node.id) if node.terminal?
-      detail = { reason: reason, generation: node.generation }
-      push_task_locked { deliver_event(node.id, event, detail, watcher_ids) }
+      queue_event(node.id, event, { reason: reason, generation: node.generation }, watcher_ids)
+    end
+
+    # Caller holds @mutex. Events go to one dedicated thread so that a slow
+    # on_event or a blocked watcher tell delays later events only, never route
+    # expiries, timers, or lifecycle work, and so that events stay ordered.
+    def queue_event(node_id, event, detail, watcher_ids, notify_application: true)
+      return if @stopped
+
+      @events << [node_id, event, detail, watcher_ids, notify_application]
+      return if @event_thread&.alive?
+
+      @event_thread = Thread.new do
+        Thread.current.report_on_exception = false
+        while (queued = @events.pop)
+          guarded("event delivery") { deliver_event(*queued) }
+        end
+      end
+      @event_thread.name = "rocoto-actor-broker-events" if @event_thread.respond_to?(:name=)
     end
 
     # Caller holds @mutex. Why the incarnation behind this reference ended, or
@@ -317,9 +337,9 @@ module RocotoActor
       reference&.exit_error&.message || reference&.exit_status&.to_s
     end
 
-    def deliver_event(node_id, event, detail, watcher_ids)
+    def deliver_event(node_id, event, detail, watcher_ids, notify_application)
       handle = ActorHandle.new(node_id, broker: self)
-      guarded("on_event") { @on_event&.call(event, handle, detail) }
+      guarded("on_event") { @on_event&.call(event, handle, detail) } if notify_application
       watcher_ids.each do |watcher_id|
         reference = @mutex.synchronize do
           watcher = @nodes[watcher_id]

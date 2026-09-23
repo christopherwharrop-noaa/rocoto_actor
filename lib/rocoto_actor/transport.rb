@@ -10,9 +10,9 @@ module RocotoActor
 
     module_function
 
-    def write(io, message = nil, timeout: nil, **fields)
+    def write(io, message = nil, **fields)
       message = fields unless fields.empty?
-      write_payload(io, dump(message), timeout: timeout)
+      write_payload(io, dump(message))
     end
 
     def dump(message)
@@ -24,21 +24,10 @@ module RocotoActor
       raise SerializationError, error.message
     end
 
-    def write_payload(io, payload, timeout: nil)
-      frame = [payload.bytesize].pack("N") << payload
-      return io.write(frame) unless timeout
-
-      deadline = monotonic_time + timeout
-      offset = 0
-      while offset < frame.bytesize
-        written = io.write_nonblock(frame.byteslice(offset..), exception: false)
-        if written == :wait_writable
-          wait_for(io, :write, deadline)
-        else
-          offset += written
-        end
-      end
-      offset
+    # Writes block until the frame is in the socket buffer; the sending side's
+    # mailbox bounds what can queue behind a blocked write.
+    def write_payload(io, payload)
+      io.write([payload.bytesize].pack("N") << payload)
     end
 
     def read(io, timeout: nil)
@@ -131,7 +120,7 @@ module RocotoActor
                   io.read(size - buffer.bytesize)
                 end
         if chunk == :wait_readable
-          wait_for(io, :read, deadline)
+          wait_for(io, deadline)
           next
         end
         return if chunk.nil? && buffer.empty?
@@ -143,14 +132,11 @@ module RocotoActor
     end
     private_class_method :read_exactly
 
-    def wait_for(io, direction, deadline)
+    def wait_for(io, deadline)
       remaining = deadline - monotonic_time
-      raise TransportTimeoutError, "transport #{direction} timed out" if remaining <= 0
+      raise TransportTimeoutError, "transport read timed out" if remaining <= 0
 
-      readers = direction == :read ? [io] : nil
-      writers = direction == :write ? [io] : nil
-      ready = IO.select(readers, writers, nil, remaining)
-      raise TransportTimeoutError, "transport #{direction} timed out" unless ready
+      raise TransportTimeoutError, "transport read timed out" unless io.wait_readable(remaining)
     end
     private_class_method :wait_for
 

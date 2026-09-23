@@ -989,6 +989,57 @@ class ActorBrokerTest < Minitest::Test
     assert @broker.stop(timeout: 2)
   end
 
+  def test_raising_future_callback_does_not_hide_an_actor_exit
+    reported = Queue.new
+    original = RocotoActor::Future.callback_error_handler
+    RocotoActor::Future.callback_error_handler = ->(error) { reported << error }
+    actor = @broker.spawn(ExampleActor, "x", name: "x")
+    pid = actor.ask(:pid).value(timeout: 2)
+    future = actor.ask(:hang)
+    future.on_resolve { |_result, _error| raise "application callback bug" }
+
+    Process.kill("KILL", pid)
+    wait_until { actor.state == :failed }
+
+    assert_equal "application callback bug", reported.pop(timeout: 2).message
+    assert_raises(RocotoActor::ActorStoppedError) { future.value(timeout: 0) }
+  ensure
+    RocotoActor::Future.callback_error_handler = original
+  end
+
+  def test_slow_on_event_does_not_delay_route_expiries
+    broker = RocotoActor::ActorBroker.new(on_event: ->(*) { sleep 1.5 })
+    target = broker.spawn(ExampleActor, "target")
+    worker = broker.spawn(ForwardingActor, target)
+    victim = broker.spawn(ExampleActor, "victim", name: "victim")
+    assert_raises(RocotoActor::ActorStoppedError) { victim.ask(:crash).value(timeout: 2) }
+    wait_until { victim.state == :failed } # on_event is now sleeping on the event thread
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    error = assert_raises(RocotoActor::RemoteError) { worker.ask(message: :hang, timeout: 0.1).value(timeout: 3) }
+
+    assert_equal "RocotoActor::AskTimeoutError", error.remote_class
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1
+  ensure
+    broker&.stop(timeout: 3, force: true)
+  end
+
+  def test_watching_a_terminal_actor_does_not_replay_the_event_to_the_application
+    events = Queue.new
+    broker = RocotoActor::ActorBroker.new(on_event: ->(event, _handle, _detail) { events << event })
+    target = broker.spawn(ExampleActor, "t", name: "target")
+    watcher = broker.spawn(WatcherActor, name: "watcher")
+    target.stop(timeout: 2)
+    assert_equal :stopped, events.pop(timeout: 2)
+
+    watcher.ask(op: :watch, handle: target).value(timeout: 2)
+    wait_until { watcher.ask(op: :events).value(timeout: 2).size == 1 }
+
+    assert_nil events.pop(timeout: 0.3), "the catch-up delivery must reach only the late watcher"
+  ensure
+    broker&.stop(timeout: 2, force: true)
+  end
+
   def test_watcher_is_told_when_a_watched_actor_fails
     watcher = @broker.spawn(WatcherActor, name: "watcher")
     target = @broker.spawn(ExampleActor, "t", name: "target")

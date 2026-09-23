@@ -170,8 +170,8 @@ bundle exec ruby -Itest test/broker_test.rb
 Latest validation (2026-09-23):
 
 ```text
-broker: 92 runs, 420 assertions, 0 failures, 0 errors
-full suite: 129 runs, 496 assertions, 0 failures, 0 errors
+broker: 95 runs, 428 assertions, 0 failures, 0 errors
+full suite: 132 runs, 504 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -286,6 +286,8 @@ A second `/code-review ultra` (whole repository, base tag `review-base` on an em
 These introduced the first observability hook: `ActorBroker.new(error_handler:)`, a callable `(error, context)` defaulting to a one-line `warn`; `report_error` never lets the handler's own exception propagate.
 
 Tagging note: a bare commit hash after `ultra` is read as a focus note, and a base with no shared history triggers a whole-repository cost confirmation that only an interactive terminal session can answer; the extension's command path cannot. `review-since-initial` (tag on `22a97a2`) is the fallback base that needs no confirmation. The note passed on the command line is never delivered to the cloud reviewers. Documented channels for review guidance are the repository's `CLAUDE.md` (project instructions) and `REVIEW.md` (review-only instructions), both read by the local `/code-review`; whether the cloud sandbox reads them is undocumented but likely, since its agents are Claude Code sessions in a clone of the repository. On 2026-09-23 the review brief moved from `docs/review-focus.md` to `REVIEW.md` and a `CLAUDE.md` was added; the next ultra run will show whether findings cite the brief's invariant numbers.
+
+A third `/code-review ultra` (2026-09-23, whole repository, after `REVIEW.md` and `CLAUDE.md` existed) returned four findings, all fixed with tests: `Future#run_callbacks` let an application `on_resolve` block that raised abort `Reference#actor_exited` before the broker's exit hook (per-callback rescue reporting to `Future.callback_error_handler`); `on_event` ran on the service thread, so a slow handler stalled expiries and timers (events now go through a dedicated ordered event thread, joined on stop); watching a terminal actor replayed the event to `on_event` (`notify_application: false` on the catch-up path); the write-with-timeout branch in `Transport.write_payload` was dead since boot became a `Reference` request (removed). None of the findings cited `REVIEW.md` invariant numbers, though all four fell inside the areas it names.
 
 Whether the whole-repository reviewers used `REVIEW.md` is unclear: none of the findings cite its invariants by number, though finding 5 is invariant 9 in substance.
 
