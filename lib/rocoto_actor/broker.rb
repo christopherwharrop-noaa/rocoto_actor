@@ -9,7 +9,9 @@ module RocotoActor
     DEFAULT_ROUTE_TIMEOUT = 30
     DEFAULT_MAX_LIFECYCLE_WORKERS = 2
     DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS = 100
-    REQUEST_OPS = %i[broker_request broker_tell broker_spawn broker_stop broker_schedule broker_cancel].freeze
+    REQUEST_OPS = %i[broker_request broker_tell broker_spawn broker_stop broker_schedule broker_cancel
+                     broker_watch broker_unwatch].freeze
+    EVENTS = %i[failed restarting restarted stopped].freeze
     MAX_TIMERS_PER_ACTOR = 100
     MIN_TIMER_INTERVAL = 0.01
     SPAWN_OPTIONS = ActorContext::SPAWN_OPTIONS
@@ -56,7 +58,9 @@ module RocotoActor
     def initialize(max_routes: DEFAULT_MAX_ROUTES, max_routes_per_actor: DEFAULT_MAX_ROUTES_PER_ACTOR,
                    route_timeout: DEFAULT_ROUTE_TIMEOUT, max_lifecycle_workers: DEFAULT_MAX_LIFECYCLE_WORKERS,
                    max_pending_lifecycle_requests: DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS,
-                   error_handler: DEFAULT_ERROR_HANDLER)
+                   error_handler: DEFAULT_ERROR_HANDLER, on_event: nil)
+      raise ArgumentError, "on_event must respond to call" unless on_event.nil? || on_event.respond_to?(:call)
+
       raise ArgumentError, "error_handler must respond to call" unless error_handler.respond_to?(:call)
 
       raise ArgumentError, "max_routes must be positive" unless max_routes.positive?
@@ -73,6 +77,9 @@ module RocotoActor
       @max_lifecycle_workers = max_lifecycle_workers
       @max_pending_lifecycle_requests = max_pending_lifecycle_requests
       @error_handler = error_handler
+      @on_event = on_event
+      @watchers = {} # watched node id => { watcher node id => true }
+      @waiting = {} # node id => id of the node it is blocked on (a call or a child's boot)
       @lifecycle_queue = [] # [source, request, release_response] or an internal callable
       @lifecycle_workers = []
       @idle_lifecycle_workers = 0
@@ -117,6 +124,19 @@ module RocotoActor
     end
 
     # Handles of top-level actors that have not stopped or failed.
+    # A plain-data snapshot of every actor the broker knows, for operators.
+    def describe
+      @mutex.synchronize do
+        {
+          stopped: @stopped,
+          routes_in_flight: @routes,
+          timers: @timers.size,
+          lifecycle_queue: @lifecycle_queue.size,
+          actors: @nodes.values.map { |node| describe_node(node) }
+        }
+      end
+    end
+
     def roots
       @mutex.synchronize do
         @nodes.values.select { |node| node.parent_id.nil? && !node.terminal? }
@@ -225,6 +245,8 @@ module RocotoActor
       when :broker_request then route(source, request, release_response)
       when :broker_tell then relay_tell(source, request, release_response)
       when :broker_schedule then schedule_timer(source, request, release_response)
+      when :broker_watch then watch(source, request, release_response)
+      when :broker_unwatch then unwatch(source, request, release_response)
       when :broker_cancel then cancel_timer(source, request, release_response)
       when :broker_spawn, :broker_stop then enqueue_lifecycle(source, request, release_response)
       else respond_error(source, request_id, Error.new("unknown broker operation"), release_response)
@@ -249,6 +271,75 @@ module RocotoActor
       respond(source, request[:request_id], nil, release_response)
     rescue StandardError => error
       respond_error(source, request[:request_id], error, release_response)
+    end
+
+    # Subscribes the requesting actor to the watched actor's lifecycle events.
+    # Watching an actor that is already terminal delivers that event at once.
+    def watch(source, request, release_response)
+      @mutex.synchronize do
+        watcher = source_node(source)
+        watched = @nodes[request[:handle_id]] or raise Error, "unknown actor handle"
+        if watched.terminal?
+          detail = { reason: watched.failure&.message || watched.exit&.to_s, generation: watched.generation }
+          push_task_locked { deliver_event(watched.id, watched.state, detail, [watcher.id]) }
+        else
+          (@watchers[watched.id] ||= {})[watcher.id] = true
+        end
+      end
+      respond(source, request[:request_id], true, release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    def unwatch(source, request, release_response)
+      removed = @mutex.synchronize do
+        watcher = @nodes[@node_ids_by_reference[source]]
+        watcher && !@watchers[request[:handle_id]]&.delete(watcher.id).nil?
+      end
+      respond(source, request[:request_id], removed, release_response)
+    rescue StandardError => error
+      respond_error(source, request[:request_id], error, release_response)
+    end
+
+    # Caller holds @mutex. Queues delivery of a lifecycle event to the
+    # application's on_event and to every watcher; a terminal event ends the
+    # watches. Delivery runs on the service thread, outside every lock.
+    def emit(node, event, reason)
+      watcher_ids = @watchers.fetch(node.id, {}).keys
+      @watchers.delete(node.id) if node.terminal?
+      detail = { reason: reason, generation: node.generation }
+      push_task_locked { deliver_event(node.id, event, detail, watcher_ids) }
+    end
+
+    # Caller holds @mutex. Why the incarnation behind this reference ended, or
+    # nil if it has not reported anything.
+    def exit_reason(reference)
+      reference&.exit_error&.message || reference&.exit_status&.to_s
+    end
+
+    def deliver_event(node_id, event, detail, watcher_ids)
+      handle = ActorHandle.new(node_id, broker: self)
+      guarded("on_event") { @on_event&.call(event, handle, detail) }
+      watcher_ids.each do |watcher_id|
+        reference = @mutex.synchronize do
+          watcher = @nodes[watcher_id]
+          watcher&.active? ? watcher.reference : nil
+        end
+        next unless reference
+
+        begin
+          reference.tell({ op: :actor_event, event: event, actor: handle, reason: detail[:reason],
+                           generation: detail[:generation] }, nil)
+        rescue StandardError => error
+          report_error(error, "event to #{watcher_id}")
+        end
+      end
+    end
+
+    # Caller holds @mutex. Ends every watch held by this incarnation.
+    def purge_watches(node)
+      @watchers.each_value { |watchers| watchers.delete(node.id) }
+      @waiting.delete(node.id)
     end
 
     # Registers a self-addressed timer for the requesting actor and answers
@@ -345,7 +436,8 @@ module RocotoActor
       reference, sender, rejection = acquire_route(source, request[:handle_id])
       return respond_error(source, request_id, rejection, release_response) if rejection
 
-      release_route = release_once { release_route_slot }
+      source_id = @mutex.synchronize { @node_ids_by_reference[source] }
+      release_route = release_once { release_route_slot(source_id) }
       begin
         future = reference.ask(request[:message], sender)
       rescue StandardError => error
@@ -569,9 +661,11 @@ module RocotoActor
 
       node, boot = launch_node(actor_class, arguments, parent_id: parent.id, name: request[:name], options: options,
                                                        start_timeout: start_timeout, policy: policy)
+      @mutex.synchronize { @waiting[parent.id] = node.id } # the parent blocks in context.spawn until the boot settles
       schedule_expiry(boot, start_timeout)
       boot.on_resolve do |_result, error|
         cancel_expiry(boot)
+        @mutex.synchronize { @waiting.delete(parent.id) if @waiting[parent.id] == node.id }
         error = settle_boot(node, error)
         if error
           respond_error(source, request[:request_id], error, release_response)
@@ -668,15 +762,29 @@ module RocotoActor
     def retire(node, state)
       node.state = state
       purge_timers(node)
-      reference = node.reference
-      return unless reference
+      purge_watches(node)
+      reason = exit_reason(node.reference)
+      if (reference = node.reference)
+        node.failure = reference.exit_error || node.failure
+        node.exit = reference.exit_status || node.exit
+        @node_ids_by_reference.delete(reference)
+        node.reference = nil
+        node.spec = nil
+        node.restarts = 0
+      end
+      emit(node, state, reason)
+    end
 
-      node.failure = reference.exit_error || node.failure
-      node.exit = reference.exit_status || node.exit
-      @node_ids_by_reference.delete(reference)
-      node.reference = nil
-      node.spec = nil
-      node.restarts = 0
+    # Caller holds @mutex.
+    def describe_node(node)
+      {
+        id: node.id, path: node.path, name: node.name, state: node.state, generation: node.generation,
+        parent_id: node.parent_id, children: node.children.dup, pid: node.reference&.pid,
+        restarts: node.restarts, waiting_on: @waiting[node.id], watchers: @watchers.fetch(node.id, {}).keys,
+        timers: @timers.count { |_id, record| record.node_id == node.id },
+        last_exit: (node.reference&.exit_status || node.exit)&.to_s,
+        last_failure: (node.reference&.exit_error || node.failure)&.message
+      }
     end
 
     # Caller holds @mutex. Returns the node only when it accepts messages.
@@ -751,8 +859,10 @@ module RocotoActor
         live = node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
         delay = restart_delay(node)
         purge_timers(node)
+        purge_watches(node)
         if delay
           node.state = :restarting
+          emit(node, :restarting, exit_reason(node.reference))
         else
           retire(node, :failed)
         end
@@ -801,6 +911,7 @@ module RocotoActor
         @node_ids_by_reference.delete(node.reference)
         node.failure = node.reference.exit_error || node.failure
         node.exit = node.reference.exit_status || node.exit
+        purge_watches(node)
         node.reference = reference
         @node_ids_by_reference[reference] = node.id
         node.generation += 1
@@ -832,6 +943,7 @@ module RocotoActor
         if node.state == :restarting && error.nil?
           node.state = :running
           node.started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          emit(node, :restarted, nil)
         end
         [!error.nil?, error.nil? && node.boot_exit.equal?(node.reference), node.reference]
       end
@@ -879,13 +991,36 @@ module RocotoActor
           next [nil, nil, BrokerBusyError.new("actor broker has #{@max_routes} routes in flight")]
         end
 
+        source_id = @node_ids_by_reference[source]
+        cycle = source_id && wait_cycle(source_id, node.id)
+        next [nil, nil, DeadlockError.new("call would deadlock: #{cycle.join(' -> ')}")] if cycle
+
         @routes += 1
+        @waiting[source_id] = node.id if source_id
         [node.reference, sender_handle(source), nil]
       end
     end
 
-    def release_route_slot
-      @mutex.synchronize { @routes -= 1 }
+    # Caller holds @mutex. Returns the path of actors that would wait on each
+    # other if source blocked on target, or nil. Assumes one outstanding call per
+    # actor; a multithreaded actor may evade detection and still times out.
+    def wait_cycle(source_id, target_id)
+      path = [source_id, target_id]
+      current = target_id
+      @nodes.size.times do
+        return path.map { |id| @nodes[id]&.path || id } if current == source_id
+
+        current = @waiting[current] or return nil
+        path << current
+      end
+      nil
+    end
+
+    def release_route_slot(source_id)
+      @mutex.synchronize do
+        @routes -= 1
+        @waiting.delete(source_id) if source_id
+      end
     end
 
     def release_once(&block)
@@ -934,6 +1069,14 @@ module RocotoActor
 
     def cancel_expiry(future)
       @mutex.synchronize { @expiries.delete(future) }
+    end
+
+    # Caller holds @mutex.
+    def push_task_locked(delay: 0, &block)
+      return if @stopped
+
+      @tasks << [Process.clock_gettime(Process::CLOCK_MONOTONIC) + delay, block]
+      wake_service
     end
 
     def enqueue_task(delay: 0, &block)

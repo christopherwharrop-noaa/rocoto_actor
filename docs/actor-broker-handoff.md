@@ -157,6 +157,7 @@ Implementation progress:
 - [x] Add logical parent/child lifecycle metadata (`ActorBroker::Node`: id, name, path, generation, parent_id, children, state, reference; `spawn(parent:, name:)`; recursive stop; failure propagation; `ActorFailedError`).
 - [x] Add broker-owned child spawning (`RocotoActor.context.spawn`, `:broker_spawn`/`:broker_stop`, bounded lifecycle pool, per-socket `BrokerClient` with unique request IDs).
 - [x] Add `tell` (one-way messages, broker-acked enqueue, sender handle in the envelope, `context.sender`, failure on unhandled exception with `handle.last_failure`).
+- [x] Add death notification (`context.watch`/`unwatch`, `:actor_event` tells; `ActorBroker.new(on_event:)`), a `shutdown` callback on graceful stop, synchronous-call deadlock detection (`DeadlockError`), and `broker.describe` (2026-09-23).
 - [x] Add self-scheduled tells (`context.schedule(message, after:, every:)` → `Timer#cancel`; broker-owned timers that die with the incarnation; undeliverable ticks dropped and reported).
 - [x] Add restart policies and generations (`restart: :never | :on_failure`, `max_restarts`, `restart_window`, `restart_backoff`; `:restarting` state; `ActorRestartingError`; `handle.generation`).
 
@@ -169,8 +170,8 @@ bundle exec ruby -Itest test/broker_test.rb
 Latest validation (2026-09-23):
 
 ```text
-broker: 80 runs, 365 assertions, 0 failures, 0 errors
-full suite: 117 runs, 441 assertions, 0 failures, 0 errors
+broker: 92 runs, 422 assertions, 0 failures, 0 errors
+full suite: 129 runs, 498 assertions, 0 failures, 0 errors
 ```
 
 The outer caller sees the innermost remote class: a target `ArgumentError` arrives as `RemoteError` with `remote_class == "ArgumentError"` and `remote_message == "requested failure"`; a broker deadline arrives as `remote_class == "RocotoActor::AskTimeoutError"`; a stopped target as `"RocotoActor::ActorStoppedError"`; an over-capacity broker as `"RocotoActor::BrokerBusyError"`; an unknown handle as `"RocotoActor::Error"` with message `unknown actor handle`.
@@ -222,6 +223,15 @@ Remove generated `Gemfile.lock` if it is untracked and was created only by local
 - Worker side: `handle.tell` sends `:broker_tell`; `ActorBroker#relay_tell` runs inline on the source's reader thread (no route slot; it never waits on the target), enqueues with `sender: sender_handle(source)`, and acks with `ok: true, result: nil` or a typed error. Routed asks now also carry the sender.
 - Failure: `Runner.run_actor` rescues an exception from a told `receive`, writes `{ op: :actor_error, error_class:, message:, backtrace: }`, and exits; `Reference` stores it as `exit_error`, `ActorBroker#last_failure` returns `node.failure || reference.exit_error`, and `relaunch` copies the previous reference's `exit_error` into `node.failure` before swapping. The exit then follows the normal failure path (`actor_failed`, restart policy).
 - Idempotency keys were deliberately left as an application pattern (dedup must live in the receiver, atomically with the effect); no envelope slot was added. Worker-side async `ask` was rejected: a future waited on inside `receive` either blocks or delivers results outside the message flow. `tell` plus reply-as-message is the async model.
+
+### Events, shutdown, deadlock detection, describe (implemented, 2026-09-23)
+
+- Chosen after comparing with Erlang/OTP and Akka: these four are what a bulkheading library with a handful of actors still lacked. Left out on purpose: supervision strategies beyond one-for-one (composable from watch + tell + stop), registry lookup by path (handles are capabilities), routers, distribution, hot code loading, become/stash.
+- Events: `emit(node, event)` runs under the broker mutex at every transition (`retire` → `:stopped`/`:failed`, `actor_failed` → `:restarting`, `settle_restart` → `:restarted`) and only queues a service task (`push_task_locked`); `deliver_event` runs on the service thread outside every lock, calls `on_event` under `guarded`, and tells each watcher `{ op: :actor_event, event:, actor:, reason:, generation: }` with no sender. Watches (`@watchers`: watched id → watcher ids) end when the watched node is retired (after its final event) and when the watcher's incarnation ends (`purge_watches` in `retire`, `actor_failed`, and `relaunch`'s install). Watching a terminal actor delivers its state as an event immediately.
+- Shutdown: `Runner.shutdown_actor` calls the actor's `shutdown` on the `:stop` op if defined; an exception becomes an `:actor_error` frame (`last_failure`) and the stop still completes; a hang is bounded by the caller's stop deadline and KILL.
+- Deadlock detection: `@waiting` maps a node to the node it is blocked on; `acquire_route` records it and walks the chain from the target (`wait_cycle`), refusing with `DeadlockError` naming the path; `release_route_slot` clears it. `spawn_child` records the parent as waiting on the child until the boot settles, so a child calling its parent from `initialize` is refused instead of waiting out both timeouts. One outstanding call per actor is assumed.
+- `describe`: plain-data snapshot under the mutex (`describe_node`).
+- Test support: `test/support/watch_actor.rb` (`WatcherActor`, `ShutdownActor`, `SelfCallActor`, `CallParentInInitActor`/`BootCyclerActor`, `CallerActor`).
 
 ### Timer design (implemented, 2026-09-23)
 

@@ -93,7 +93,7 @@ broker.stop
 
 An actor can call a shared handle with `handle.call(message, timeout:)` or send it a one-way message with `handle.tell(message)` (see "Tell"). Calls are routed through the broker and do not transfer socket descriptors between actors. Brokered handles are stable logical identities, but brokered calls are at-most-once and an actor failure can leave the operation outcome ambiguous. Do not retry non-idempotent operations without an application-level request ID and deduplication policy.
 
-`call` blocks the calling actor until the broker answers, so two actors that synchronously call each other deadlock until their timeouts expire. Messages sent to the calling actor while it waits are processed afterwards in arrival order.
+`call` blocks the calling actor until the broker answers. Two actors that synchronously call each other would wait for each other's timeout, so the broker refuses the call that would close the cycle with `RocotoActor::DeadlockError` (the same applies to an actor calling itself, and to a child calling its parent while the parent is still waiting in `context.spawn` for that child to boot). Detection assumes one outstanding call per actor; a multithreaded actor can evade it and still times out. Messages sent to the calling actor while it waits are processed afterwards in arrival order.
 
 The broker owns every brokered deadline. A call with no `timeout:` uses the broker's `route_timeout:` (30 seconds by default), and the broker answers every accepted request exactly once with a result, a `RocotoActor::AskTimeoutError`, or another error. Errors that cross actor boundaries keep their original class, message, and backtrace: the caller sees a `RocotoActor::RemoteError` whose `remote_class` names the class raised in the target actor, or `RocotoActor::ActorStoppedError` when the target is gone, or `RocotoActor::Error` with message `unknown actor handle` for a handle the broker does not own.
 
@@ -149,6 +149,34 @@ end
 During `receive`, `RocotoActor.context.sender` is the handle of the actor that sent the current message (told or called), or `nil` when it came from the application; `sender.tell` is the reply path. The return value of `receive` is discarded for a told message.
 
 Because no reply can carry an exception, an unhandled exception while processing a told message ends the actor: the process exits, the broker records the error as `handle.last_failure` (a `RemoteError`), and the restart policy decides what happens next. Whatever ends an actor's process on its own, the watchdog reports how: `handle.last_exit` is a `RocotoActor::ExitStatus` with `exitstatus` or `termsig` (`signaled?`, and `to_s` such as `killed by signal 9 (KILL)`), retained across a restart. It is `nil` while the actor runs and after an orderly `stop`. A signal delivered to the worker ends it by that signal, so an OOM kill or an external `TERM` is reported as such rather than masked as a normal exit. With the default policy the actor stays `:failed`; with `restart: :on_failure` it is relaunched and later tells are processed by the new incarnation. Messages that were in its mailbox are not replayed.
+
+### Watching other actors
+
+An actor that spawned or was handed another actor can ask to be told when that actor's life changes:
+
+```ruby
+class SupervisorActor
+  def initialize
+    @worker = RocotoActor.context.spawn(WorkerActor, name: "worker")
+    RocotoActor.context.watch(@worker)
+  end
+
+  def receive(message)
+    case message[:op]
+    when :actor_event
+      # message[:event] is :failed, :restarting, :restarted, or :stopped;
+      # message[:actor] is the handle, message[:reason] the exit reason or nil.
+      respawn if message[:event] == :failed
+    end
+  end
+end
+```
+
+The event arrives as a tell from the broker (`context.sender` is `nil`). A watch lasts until the watched actor stops or fails for good, or until the watching incarnation ends; a restarted watcher must watch again, just as it respawns its children. Watching an actor that has already stopped or failed delivers that event immediately. `context.unwatch(handle)` ends a watch early. The application sees the same events through `RocotoActor::ActorBroker.new(on_event: ->(event, handle, detail) { ... })`, called on a broker thread with `detail[:reason]` and `detail[:generation]`.
+
+### Shutting down cleanly
+
+If an actor defines `shutdown`, a graceful `stop` calls it after the mailbox has drained and before the process exits, so a database actor can commit and close. It runs within the stop's deadline: a `shutdown` that hangs is killed like any other overrun, and one that raises is recorded as the actor's `last_failure` without preventing the stop. A crash, a forced stop, or a `KILL` never reaches it.
 
 ### Scheduling messages to yourself
 
@@ -207,6 +235,8 @@ end
 ```
 
 Inside an actor a handle supports `call` and `stop` only. `ask` returns a `RocotoActor::Future` and is an application-side API; calling it, or `state`, `children`, and the other broker queries, inside an actor raises `RocotoActor::Error` naming the method and the alternative. `context.spawn` accepts `name:`, `source:`, `start_timeout:`, `mailbox_size:`, and `mailbox_bytes:`; it blocks until the child is ready or fails, and a boot failure is raised as `RocotoActor::RemoteError` with the child's error class. Children may be spawned from `initialize` as well as from `receive`; an actor is registered with the broker in a `:starting` state while its constructor runs, and nested initialization (children that spawn grandchildren in their own constructors) does not tie up broker threads. If `initialize` raises, the actor is discarded along with any children it already spawned, and the spawner sees the constructor's error. `broker.roots` lists the live top-level actors. An actor can stop handles of its own descendants and nothing else. Spawn and stop requests run on a small pool of broker threads (`max_lifecycle_workers:`, default 2) with a bounded queue (`max_pending_lifecycle_requests:`, default 100); a request beyond the queue fails with `RocotoActor::BrokerBusyError`.
+
+`broker.describe` returns a plain-data snapshot for operators: broker counters (routes in flight, timers, queued lifecycle requests) and, per actor, its path, state, generation, pid, restart count, what it is waiting on, its watchers and timers, and its last exit reason and failure.
 
 The broker's own threads never die silently: a failure while running a route expiry, a scheduled task, or an actor's spawn/stop request is passed to the broker's `error_handler:` (a callable receiving the error and a short context string; the default writes one line to the application's standard error) and the thread carries on. Replace it to route these into your logging.
 

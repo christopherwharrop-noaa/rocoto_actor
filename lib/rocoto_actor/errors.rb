@@ -5,6 +5,7 @@ module RocotoActor
   class ActorStoppedError < Error; end
   class ActorFailedError < ActorStoppedError; end
   class ActorRestartingError < Error; end
+  class DeadlockError < Error; end
   class AskTimeoutError < Error; end
   class BrokerBusyError < Error; end
   class MailboxFullError < Error; end

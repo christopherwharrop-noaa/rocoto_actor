@@ -19,6 +19,18 @@ module RocotoActor
       @handle = actor_id && ActorHandle.new(actor_id, socket: socket)
     end
 
+    # Asks the broker to tell this actor { op: :actor_event, event:, actor:,
+    # reason:, generation: } whenever the watched actor fails, restarts, is
+    # restarted, or stops. The watch ends when the watched actor stops or
+    # fails for good, or when this incarnation of the watcher ends.
+    def watch(handle)
+      @client.request(op: :broker_watch, handle_id: handle.id)
+    end
+
+    def unwatch(handle)
+      @client.request(op: :broker_unwatch, handle_id: handle.id)
+    end
+
     # Schedules a tell from this actor to itself: once after `after:` seconds,
     # or every `every:` seconds (starting after `after:` when both are given).
     # The message arrives in receive with sender == handle. The timer dies with

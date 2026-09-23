@@ -45,6 +45,7 @@ module RocotoActor
 
         case request.fetch(:op)
         when :stop
+          shutdown_actor(socket, actor)
           Transport.write(socket, id: request.fetch(:id), ok: true, result: nil)
           break
         when :ask
@@ -101,6 +102,18 @@ module RocotoActor
       exit!(128 + signo)
     end
     private_class_method :die_by_signal
+
+    # An actor that defines shutdown gets to flush and close before a graceful
+    # stop completes; an exception there is reported as the actor's failure
+    # but does not prevent the stop. A crash or KILL never reaches it.
+    def shutdown_actor(socket, actor)
+      return unless actor.respond_to?(:shutdown)
+
+      actor.shutdown
+    rescue StandardError, ScriptError => error
+      report_failure(socket, error)
+    end
+    private_class_method :shutdown_actor
 
     def deliver(actor, request)
       RocotoActor.context.sender = request[:sender]

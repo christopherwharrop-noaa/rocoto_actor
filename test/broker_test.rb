@@ -8,6 +8,8 @@ require_relative "support/supervisor_actor"
 require_relative "support/tell_actor"
 require_relative "validation/support"
 require_relative "support/ticker_actor"
+require_relative "support/watch_actor"
+require "tmpdir"
 
 class ActorBrokerTest < Minitest::Test
   def setup
@@ -983,6 +985,172 @@ class ActorBrokerTest < Minitest::Test
     assert_kind_of RocotoActor::Timer, timer
     assert_raises(RocotoActor::Error) { timer.cancel }
     assert @broker.stop(timeout: 2)
+  end
+
+  def test_watcher_is_told_when_a_watched_actor_fails
+    watcher = @broker.spawn(WatcherActor, name: "watcher")
+    target = @broker.spawn(ExampleActor, "t", name: "target")
+    assert_equal true, watcher.ask(op: :watch, handle: target).value(timeout: 2)
+
+    assert_raises(RocotoActor::ActorStoppedError) { target.ask(:crash).value(timeout: 2) }
+    wait_until { watcher.ask(op: :events).value(timeout: 2).size == 1 }
+
+    event = watcher.ask(op: :events).value(timeout: 2).first
+    assert_equal :failed, event[:event]
+    assert_equal target, event[:actor]
+    assert_match(/exited with status 3/, event[:reason])
+    assert_equal 1, event[:generation]
+    assert event[:from_system], "lifecycle events come from the broker, with no sender"
+    assert_equal false, watcher.ask(op: :unwatch, handle: target).value(timeout: 2), "watch ends with the actor"
+  end
+
+  def test_watcher_sees_restart_and_stop_events
+    watcher = @broker.spawn(WatcherActor, name: "watcher")
+    target = @broker.spawn(ExampleActor, "t", name: "target", restart: :on_failure, restart_backoff: 0.01)
+    watcher.ask(op: :watch, handle: target).value(timeout: 2)
+
+    assert_raises(RocotoActor::ActorStoppedError) { target.ask(:crash).value(timeout: 2) }
+    wait_until { watcher.ask(op: :events).value(timeout: 2).map { |e| e[:event] } == %i[restarting restarted] }
+    assert target.stop(timeout: 2)
+    wait_until { watcher.ask(op: :events).value(timeout: 2).size == 3 }
+
+    events = watcher.ask(op: :events).value(timeout: 2)
+    assert_equal(%i[restarting restarted stopped], events.map { |e| e[:event] })
+    assert_equal([1, 2, 2], events.map { |e| e[:generation] })
+  end
+
+  def test_watching_a_terminal_actor_delivers_its_event_immediately
+    watcher = @broker.spawn(WatcherActor, name: "watcher")
+    target = @broker.spawn(ExampleActor, "t", name: "target")
+    target.stop(timeout: 2)
+
+    watcher.ask(op: :watch, handle: target).value(timeout: 2)
+    wait_until { watcher.ask(op: :events).value(timeout: 2).size == 1 }
+
+    assert_equal :stopped, watcher.ask(op: :events).value(timeout: 2).first[:event]
+  end
+
+  def test_application_on_event_hook_receives_lifecycle_events
+    events = Queue.new
+    broker = RocotoActor::ActorBroker.new(on_event: ->(event, handle, detail) { events << [event, handle, detail] })
+    actor = broker.spawn(ExampleActor, "t", name: "target", restart: :on_failure, restart_backoff: 0.01)
+
+    assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+    restarting = events.pop(timeout: 5)
+    restarted = events.pop(timeout: 5)
+    actor.stop(timeout: 2)
+    stopped = events.pop(timeout: 5)
+
+    assert_equal [:restarting, actor], restarting.first(2)
+    assert_match(/exited with status 3/, restarting.last[:reason])
+    assert_equal [:restarted, actor, { reason: nil, generation: 2 }], restarted
+    assert_equal [:stopped, actor], stopped.first(2)
+  ensure
+    broker&.stop(timeout: 2, force: true)
+  end
+
+  def test_watches_end_with_the_watcher_incarnation
+    watcher = @broker.spawn(WatcherActor, name: "watcher", restart: :on_failure, restart_backoff: 0.01)
+    target = @broker.spawn(ExampleActor, "t", name: "target")
+    watcher.ask(op: :watch, handle: target).value(timeout: 2)
+
+    assert_raises(RocotoActor::ActorStoppedError) { watcher.ask(op: :crash).value(timeout: 2) }
+    wait_until { watcher.state == :running && watcher.generation == 2 }
+    assert_raises(RocotoActor::ActorStoppedError) { target.ask(:crash).value(timeout: 2) }
+    wait_until { target.state == :failed }
+    sleep 0.3
+
+    assert_empty watcher.ask(op: :events).value(timeout: 2), "a restarted watcher does not inherit old watches"
+  end
+
+  def test_shutdown_runs_on_graceful_stop_only
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "graceful")
+      actor = @broker.spawn(ShutdownActor, path, name: "clean")
+      assert actor.stop(timeout: 2)
+      assert_equal "shutdown ran", File.read(path)
+
+      forced = @broker.spawn(ShutdownActor, File.join(dir, "forced"), name: "forced")
+      forced.stop(force: true)
+      refute File.exist?(File.join(dir, "forced"))
+    end
+  end
+
+  def test_shutdown_failure_is_reported_and_stop_completes
+    actor = @broker.spawn(ShutdownActor, "/nonexistent", :raise, name: "raises")
+
+    assert actor.stop(timeout: 2)
+
+    assert_equal :stopped, actor.state
+    assert_equal "shutdown failed", actor.last_failure.remote_message
+  end
+
+  def test_hanging_shutdown_is_killed_at_the_deadline
+    actor = @broker.spawn(ShutdownActor, "/nonexistent", :hang, name: "hangs")
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    assert actor.stop(timeout: 0.3)
+
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 2
+    refute actor.alive?
+  end
+
+  def test_mutual_calls_are_refused_as_a_deadlock
+    a = @broker.spawn(CallerActor, name: "a")
+    b = @broker.spawn(CallerActor, name: "b")
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    error = assert_raises(RocotoActor::RemoteError) do
+      a.ask(target: b, message: { target: a, message: "ping" }).value(timeout: 5)
+    end
+
+    assert_equal "RocotoActor::DeadlockError", error.remote_class
+    assert_match(/b -> a/, error.remote_message)
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 2
+    assert_equal :running, a.state
+    assert_equal :running, b.state
+  end
+
+  def test_self_call_is_refused_as_a_deadlock
+    actor = @broker.spawn(SelfCallActor, name: "selfish")
+
+    error = assert_raises(RocotoActor::RemoteError) { actor.ask(:go).value(timeout: 5) }
+
+    assert_equal "RocotoActor::DeadlockError", error.remote_class
+  end
+
+  def test_calling_the_parent_during_its_wait_for_the_boot_is_refused
+    parent = @broker.spawn(BootCyclerActor, name: "parent")
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    error = assert_raises(RocotoActor::RemoteError) { parent.ask(:go).value(timeout: 10) }
+
+    assert_equal "RocotoActor::DeadlockError", error.remote_class
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5
+    assert_empty parent.children
+  end
+
+  def test_describe_reports_every_actor
+    watcher = @broker.spawn(WatcherActor, name: "watcher")
+    watcher.ask(op: :watch, handle: @database).value(timeout: 2)
+    crasher = @broker.spawn(ExampleActor, "c", name: "crasher")
+    assert_raises(RocotoActor::ActorStoppedError) { crasher.ask(:crash).value(timeout: 2) }
+    wait_until { crasher.state == :failed && crasher.last_exit }
+
+    snapshot = @broker.describe
+
+    assert_equal false, snapshot[:stopped]
+    assert_equal 0, snapshot[:routes_in_flight]
+    database = snapshot[:actors].find { |actor| actor[:id] == @database.id }
+    assert_equal :running, database[:state]
+    assert_kind_of Integer, database[:pid]
+    assert_equal [watcher.id], database[:watchers]
+    crashed = snapshot[:actors].find { |actor| actor[:id] == crasher.id }
+    assert_equal :failed, crashed[:state]
+    assert_nil crashed[:pid]
+    assert_equal "exited with status 3", crashed[:last_exit]
+    assert_equal %i[id path name state generation parent_id children pid restarts waiting_on watchers timers
+                    last_exit last_failure], crashed.keys
   end
 
   private
