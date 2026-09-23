@@ -211,7 +211,8 @@ class ActorBrokerTest < Minitest::Test
     grandchild = @broker.spawn(ExampleActor, "grandchild", name: "grandchild", parent: child)
 
     assert_raises(RocotoActor::ActorStoppedError) { parent.ask(:crash).value(timeout: 2) }
-    wait_until { grandchild.state == :stopped }
+    # Descendants are retired deepest first; wait for the last one, not the first.
+    wait_until { child.state == :stopped && grandchild.state == :stopped }
 
     assert_equal :failed, parent.state
     assert_equal 1, parent.generation
@@ -528,7 +529,8 @@ class ActorBrokerTest < Minitest::Test
     new_children = supervisor.children
     assert_equal %w[sup/c0 sup/c1], new_children.map(&:path)
     assert_empty new_children & old_children
-    old_children.each { |child| assert_equal :stopped, child.state }
+    # The old children are stopped on the lifecycle pool, concurrently with the relaunch.
+    wait_until { old_children.all? { |child| child.state == :stopped } }
     assert_equal ["leaf: hi", "leaf: hi"], supervisor.ask("hi").value(timeout: 5)
   end
 
