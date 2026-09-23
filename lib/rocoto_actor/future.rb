@@ -46,6 +46,9 @@ module RocotoActor
 
     # Registers a block called once with (result, error) when the future resolves.
     # The block runs on the resolving thread, or immediately if already resolved.
+    # It must not raise: an exception is reported to Future.callback_error_handler
+    # (by default one line on standard error) and neither reaches the resolving
+    # thread nor prevents later callbacks.
     def on_resolve(&block)
       resolved = @mutex.synchronize do
         @callbacks << block unless @resolved
@@ -100,7 +103,28 @@ module RocotoActor
         @callbacks = []
         values
       end
-      callbacks.each { |callback| callback.call(@result, @error) }
+      callbacks.each do |callback|
+        callback.call(@result, @error)
+      rescue StandardError, ScriptError => error
+        Future.report_callback_error(error)
+      end
+    end
+
+    class << self
+      # A callable receiving an exception raised by an on_resolve block.
+      attr_writer :callback_error_handler
+
+      def callback_error_handler
+        @callback_error_handler ||= lambda { |error|
+          warn "rocoto_actor: future callback raised #{error.class}: #{error.message}"
+        }
+      end
+
+      def report_callback_error(error)
+        callback_error_handler.call(error)
+      rescue StandardError
+        nil
+      end
     end
   end
 end
