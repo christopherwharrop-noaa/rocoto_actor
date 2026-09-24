@@ -22,18 +22,18 @@ module RocotoActor
       @mutex.synchronize do
         @next_request_id += 1
         request_id = @next_request_id
-        Transport.write(@socket, fields.merge(request_id: request_id))
+        Transport.write(@socket, Protocol.with_request_id(fields, request_id))
 
         loop do
           response = Transport.read(@socket)
           raise ActorStoppedError, "broker connection closed" unless response
 
-          unless response[:op] == :broker_response
+          unless Protocol.broker_response?(response)
             @deferred_frames << response
             next
           end
           # A response for an earlier request that is no longer awaited is discarded.
-          next unless response[:request_id] == request_id
+          next unless Protocol.response_for?(response, request_id)
 
           return response[:result] if response[:ok]
 

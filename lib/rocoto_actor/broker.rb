@@ -9,8 +9,6 @@ module RocotoActor
     DEFAULT_ROUTE_TIMEOUT = 30
     DEFAULT_MAX_LIFECYCLE_WORKERS = 2
     DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS = 100
-    REQUEST_OPS = %i[broker_request broker_tell broker_spawn broker_stop broker_schedule broker_cancel
-                     broker_watch broker_unwatch].freeze
     EVENTS = %i[failed restarting restarted stopped].freeze
     MAX_TIMERS_PER_ACTOR = 100
     MIN_TIMER_INTERVAL = 0.01
@@ -348,8 +346,8 @@ module RocotoActor
         next unless reference
 
         begin
-          reference.tell({ op: :actor_event, event: event, actor: handle, reason: detail[:reason],
-                           generation: detail[:generation] }, nil)
+          reference.tell(Protocol.request(:actor_event, event: event, actor: handle, reason: detail[:reason],
+                                                        generation: detail[:generation]), nil)
         rescue StandardError => error
           report_error(error, "event to #{watcher_id}")
         end
@@ -1063,18 +1061,7 @@ module RocotoActor
     end
 
     def respond_error(source, request_id, error, on_done)
-      if error.is_a?(RemoteError)
-        source.send_broker_response(
-          request_id,
-          error: error,
-          error_class: error.remote_class,
-          message: error.remote_message,
-          backtrace: error.remote_backtrace,
-          on_done: on_done
-        )
-      else
-        source.send_broker_response(request_id, error: error, on_done: on_done)
-      end
+      source.send_broker_response(request_id, error: error, on_done: on_done)
     rescue StandardError
       on_done.call
     end

@@ -24,11 +24,11 @@ module RocotoActor
     # restarted, or stops. The watch ends when the watched actor stops or
     # fails for good, or when this incarnation of the watcher ends.
     def watch(handle)
-      @client.request(op: :broker_watch, handle_id: handle.id)
+      @client.request(Protocol.request(:broker_watch, handle_id: handle.id))
     end
 
     def unwatch(handle)
-      @client.request(op: :broker_unwatch, handle_id: handle.id)
+      @client.request(Protocol.request(:broker_unwatch, handle_id: handle.id))
     end
 
     # Schedules a tell from this actor to itself: once after `after:` seconds,
@@ -38,7 +38,7 @@ module RocotoActor
     # initialize. A tick that cannot be delivered is dropped and reported to the
     # broker's error_handler.
     def schedule(message, after: nil, every: nil)
-      @client.request(op: :broker_schedule, message: message, after: after, every: every)
+      @client.request(Protocol.request(:broker_schedule, message: message, after: after, every: every))
     end
 
     # Asks the broker to spawn a logical child of this actor and returns its
@@ -53,14 +53,15 @@ module RocotoActor
       source ||= Object.const_source_location(actor_name)&.first
       raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source
 
-      @client.request(
-        op: :broker_spawn,
+      request = Protocol.request(
+        :broker_spawn,
         actor_class: actor_name,
         source: File.expand_path(source),
         arguments: arguments,
         name: name,
         options: options
       )
+      @client.request(request)
     end
   end
 end
