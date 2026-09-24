@@ -13,11 +13,11 @@ module RocotoActor
     MAX_TIMERS_PER_ACTOR = 100
     MIN_TIMER_INTERVAL = 0.01
     SPAWN_OPTIONS = ActorContext::SPAWN_OPTIONS
-    STATES = %i[starting running restarting stopping stopped failed].freeze
-    TERMINAL_STATES = %i[stopped failed].freeze
+    STATES = ActorNode::STATES
+    TERMINAL_STATES = ActorNode::TERMINAL_STATES
     # States in which the actor's process may issue broker requests; a
     # :restarting node is only reachable while its relaunch is booting.
-    ACTIVE_STATES = %i[starting running restarting].freeze
+    ACTIVE_STATES = ActorNode::ACTIVE_STATES
     RESTART_POLICIES = %i[never on_failure].freeze
     DEFAULT_MAX_RESTARTS = 3
     DEFAULT_RESTART_WINDOW = 60
@@ -28,22 +28,6 @@ module RocotoActor
     end
 
     TimerRecord = Struct.new(:id, :node_id, :generation, :message, :every)
-
-    # Logical lifecycle record for one brokered actor. Every actor process is a
-    # direct child of the application; parent/child structure exists only here.
-    # A node is registered while its actor boots (:starting) so the actor can
-    # spawn children from initialize; a failed boot unregisters it. spec holds
-    # what is needed to relaunch the actor; restarts records recent restart times.
-    Node = Struct.new(:id, :name, :path, :generation, :parent_id, :children, :state, :reference, :booting,
-                      :spec, :policy, :restarts, :failure, :exit, :boot_exit, :started_at) do
-      def terminal?
-        TERMINAL_STATES.include?(state)
-      end
-
-      def active?
-        ACTIVE_STATES.include?(state)
-      end
-    end
 
     # max_routes bounds brokered requests awaiting a target actor across the broker.
     # max_routes_per_actor bounds the broker responses owed to one source actor that
@@ -499,14 +483,11 @@ module RocotoActor
       children, exited, reference = @mutex.synchronize do
         next [[], false, nil] unless node.booting
 
-        node.booting = false
         if error
+          node.boot_failed
           [node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, node.reference]
         else
-          if node.state == :starting
-            node.state = :running
-            node.started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          end
+          node.boot_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC))
           [[], node.boot_exit.equal?(node.reference), nil]
         end
       end
@@ -681,7 +662,10 @@ module RocotoActor
         parent = check_placement(parent_id, name)
         name ||= id
         path = parent ? "#{parent.path}/#{name}" : name
-        node = Node.new(id, name, path, 1, parent_id, [], :starting, reference, true, spec, policy, 0)
+        node = ActorNode.new(
+          id: id, name: name, path: path, parent_id: parent_id, reference: reference,
+          spec: spec, policy: policy
+        )
         @nodes[id] = node
         @node_ids_by_reference[reference] = id
         parent&.children&.push(id)
@@ -698,18 +682,11 @@ module RocotoActor
     # only a live actor needs: the reference (threads, socket) and the relaunch
     # spec. The node itself stays so its handle keeps answering with its state.
     def retire(node, state)
-      node.state = state
       purge_timers(node)
       purge_watches(node)
       reason = exit_reason(node.reference)
-      if (reference = node.reference)
-        node.failure = reference.exit_error || node.failure
-        node.exit = reference.exit_status || node.exit
-        @node_ids_by_reference.delete(reference)
-        node.reference = nil
-        node.spec = nil
-        node.restarts = 0
-      end
+      reference = node.retire(state)
+      @node_ids_by_reference.delete(reference) if reference
       emit(node, state, reason)
     end
 
@@ -754,7 +731,7 @@ module RocotoActor
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       nodes = @mutex.synchronize do
         roots.flat_map { |root| live_postorder(root) }.uniq.map do |node|
-          node.state = :stopping
+          node.begin_stopping
           [node, node.reference]
         end
       end
@@ -773,7 +750,7 @@ module RocotoActor
         return if node.terminal? || !node.reference.equal?(reference)
 
         if node.booting
-          node.boot_exit = reference
+          node.record_boot_exit(reference)
           return
         end
         if node.state == :stopping
@@ -793,13 +770,13 @@ module RocotoActor
 
         # Mark the whole live subtree now so it rejects messages before the
         # service thread gets to it; stop_subtrees re-derives the order itself.
-        live_postorder(node).each { |descendant| descendant.state = :stopping unless descendant.equal?(node) }
+        live_postorder(node).each { |descendant| descendant.begin_stopping unless descendant.equal?(node) }
         live = node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
         delay = restart_delay(node)
         purge_timers(node)
         purge_watches(node)
         if delay
-          node.state = :restarting
+          node.begin_restarting
           emit(node, :restarting, exit_reason(node.reference))
         else
           retire(node, :failed)
@@ -827,12 +804,10 @@ module RocotoActor
       return nil if @stopped || node.policy[:restart] == :never
 
       now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      node.restarts = 0 if node.started_at && now - node.started_at > node.policy[:restart_window]
-      node.started_at = nil
-      return nil if node.restarts >= node.policy[:max_restarts]
+      attempt = node.record_restart_attempt(now, node.policy[:restart_window])
+      return nil unless attempt
 
-      node.restarts += 1
-      node.policy[:restart_backoff] * (2**(node.restarts - 1))
+      node.policy[:restart_backoff] * (2**(attempt - 1))
     end
 
     # Runs on a lifecycle thread. Replaces the node's dead reference with a new
@@ -847,13 +822,9 @@ module RocotoActor
         next false unless node.state == :restarting
 
         @node_ids_by_reference.delete(node.reference)
-        node.failure = node.reference.exit_error || node.failure
-        node.exit = node.reference.exit_status || node.exit
         purge_watches(node)
-        node.reference = reference
+        node.install_restarted_reference(reference)
         @node_ids_by_reference[reference] = node.id
-        node.generation += 1
-        node.booting = true
         true
       end
       unless installed
@@ -877,11 +848,11 @@ module RocotoActor
       kill, exited, reference = @mutex.synchronize do
         next [false, false, nil] unless node.booting
 
-        node.booting = false
         if node.state == :restarting && error.nil?
-          node.state = :running
-          node.started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          node.restart_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC))
           emit(node, :restarted, nil)
+        elsif error
+          node.boot_failed
         end
         [!error.nil?, error.nil? && node.boot_exit.equal?(node.reference), node.reference]
       end
