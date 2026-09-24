@@ -53,6 +53,19 @@ Owns the logical actor registry and all cross-actor policy:
 The broker has one mutex protecting this state. It never calls a `Reference`
 method that takes the reference mutex while holding the broker mutex.
 
+Mechanical broker concurrency is delegated to three private executors:
+
+- `EventDispatcher` owns watcher IDs, ordered event delivery, and the event
+  thread.
+- `DeadlineScheduler` owns route expirations, delayed tasks, and the service
+  thread.
+- `LifecycleExecutor` owns bounded blocking spawn/stop/relaunch jobs and its
+  worker pool.
+
+These executors do not own actor state. They invoke broker callbacks after
+releasing their own queue locks; `ActorBroker` remains the policy and state
+owner.
+
 ### `Reference`
 
 Owns one actor connection and process group:
@@ -97,9 +110,12 @@ outside its mutex.
 
 ## Threads owned by the broker
 
-- **Service thread:** route expiries, timer firing, delayed restart work.
-- **Lifecycle pool:** blocking child spawn/stop and relaunch operations.
-- **Event thread:** ordered application callbacks and watch notifications.
+- **Deadline scheduler thread:** route expirations, timer firing, delayed restart
+  work.
+- **Lifecycle executor pool:** blocking child spawn/stop and relaunch
+  operations.
+- **Event dispatcher thread:** ordered application callbacks and watch
+  notifications.
 
 These remain separate because service deadlines must not be delayed by
 blocking lifecycle operations or slow event consumers.
