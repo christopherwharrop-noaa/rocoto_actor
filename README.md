@@ -250,6 +250,9 @@ RocotoActor is a reliability bulkhead, not a sandbox for hostile code. Actor wor
 
 ## Development
 
+See [docs/architecture.md](docs/architecture.md) for the process model,
+component responsibilities, thread ownership, and concurrency rules.
+
 ```sh
 bundle install
 bundle exec rake          # rubocop, then the test suite

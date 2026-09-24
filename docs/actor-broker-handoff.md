@@ -1,5 +1,10 @@
 # ActorBroker Implementation Handoff
 
+> Historical design and validation record. For the current component model,
+> thread ownership, lock rules, and source map, start with
+> [architecture.md](architecture.md). This file preserves implementation
+> chronology and review findings.
+
 ## Purpose
 
 This document preserves the design discussion and current implementation state for adding process-isolated actor handles and a parent-owned actor broker to RocotoActor. It is intended for a future Copilot, Claude Code, or other coding session.
