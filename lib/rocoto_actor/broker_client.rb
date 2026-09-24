@@ -6,10 +6,11 @@ module RocotoActor
   # between handles, and frames read while waiting that are not broker
   # responses are kept for the actor loop.
   class BrokerClient
-    attr_reader :deferred_frames
+    attr_reader :decode_bindings, :deferred_frames
 
     def initialize(socket)
       @socket = socket
+      @decode_bindings = DecodeBindings.new(socket: socket)
       @mutex = Mutex.new
       @next_request_id = 0
       @deferred_frames = []
@@ -25,7 +26,7 @@ module RocotoActor
         Transport.write(@socket, Protocol.with_request_id(fields, request_id))
 
         loop do
-          response = Transport.read(@socket)
+          response = Transport.read(@socket, bindings: decode_bindings)
           raise ActorStoppedError, "broker connection closed" unless response
 
           unless Protocol.broker_response?(response)
