@@ -84,9 +84,11 @@ No socket descriptor or `Reference` crosses an actor boundary.
 
 ### `Transport` and `Future`
 
-`Transport` implements length-prefixed tagged JSON with frame, type, cycle,
-and nesting validation. `Future` provides a single permanent result, error, or
-timeout and invokes resolution callbacks outside its mutex.
+`Protocol` defines operation names and constructs request, success, failure,
+and broker-response envelopes. `Transport` implements length-prefixed tagged
+JSON with frame, type, cycle, and nesting validation. `Future` provides a
+single permanent result, error, or timeout and invokes resolution callbacks
+outside its mutex.
 
 ## Threads owned by the broker
 
@@ -128,7 +130,7 @@ interleavings that reviews must preserve.
 | --- | --- |
 | Public API | `broker.rb`, `handle.rb`, `context.rb`, `timer.rb`, `future.rb` |
 | Connection and process lifecycle | `reference.rb`, `launcher.rb`, `runner.rb` |
-| Worker-to-broker protocol | `broker_client.rb`, `transport.rb` |
+| Worker-to-broker protocol | `protocol.rb`, `broker_client.rb`, `transport.rb` |
 | Errors | `errors.rb` |
 | Routing tests | `test/broker_routing_test.rb` |
 | Hierarchy and shutdown tests | `test/broker_lifecycle_test.rb` |

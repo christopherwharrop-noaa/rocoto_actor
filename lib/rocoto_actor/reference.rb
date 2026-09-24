@@ -84,20 +84,8 @@ module RocotoActor
 
     # Queues a broker response ahead of ordinary asks. on_done is called once the
     # response is written to the actor or discarded because the actor stopped.
-    def send_broker_response(request_id, result: nil, error: nil, error_class: nil, message: nil, backtrace: nil,
-                             on_done: nil)
-      response = if error
-                   {
-                     op: :broker_response,
-                     request_id: request_id,
-                     ok: false,
-                     error_class: error_class || error.class.name,
-                     message: message || error.message,
-                     backtrace: backtrace || error.backtrace || []
-                   }
-                 else
-                   { op: :broker_response, request_id: request_id, ok: true, result: result }
-                 end
+    def send_broker_response(request_id, result: nil, error: nil, on_done: nil)
+      response = Protocol.broker_response(request_id, result: result, error: error)
       payload = Transport.dump(response)
       queued = @pending_mutex.synchronize do
         next false if @writer_stopped
@@ -113,20 +101,20 @@ module RocotoActor
     # application; the receiving actor sees it as RocotoActor.context.sender.
     # It is positional so that a bare hash message is never taken as keywords.
     def ask(message, sender = nil)
-      enqueue({ op: :ask, message: message, sender: sender }).last
+      enqueue(Protocol.request(:ask, message: message, sender: sender)).last
     end
 
     # Enqueues a message that expects no reply. Returns once it is in the
     # mailbox; raises MailboxFullError or ActorStoppedError if it is not.
     def tell(message, sender = nil)
-      enqueue({ op: :tell, message: message, sender: sender }, reply: false)
+      enqueue(Protocol.request(:tell, message: message, sender: sender), reply: false)
       nil
     end
 
     # Sends the boot message; the future resolves once the actor's initialize
     # has returned. Called once by the launcher before any ask.
     def boot(arguments, context)
-      @boot_id, future = enqueue({ op: :boot, arguments: arguments, context: context }, limit: false)
+      @boot_id, future = enqueue(Protocol.request(:boot, arguments: arguments, context: context), limit: false)
       future
     end
 
@@ -144,7 +132,7 @@ module RocotoActor
         @next_id += 1
         id = @next_id
         future = Future.new { remove_pending(id) }
-        payload = Transport.dump(op: :stop, id: id)
+        payload = Transport.dump(Protocol.request(:stop, id: id))
         wait_for_mailbox_space(deadline, payload.bytesize)
         @pending[id] = future
         @outbox << payload
@@ -273,7 +261,7 @@ module RocotoActor
 
     def read_replies
       while (reply = Transport.read(@socket))
-        if ActorBroker::REQUEST_OPS.include?(reply[:op])
+        if Protocol.broker_request?(reply)
           broker = @pending_mutex.synchronize { @broker }
           if broker
             broker.dispatch(self, reply)
