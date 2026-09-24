@@ -19,9 +19,10 @@ constant.
 
 ## Where to look
 
-- `docs/actor-broker-handoff.md` is the design record: every decision, every
-  review finding and its fix, and the validation results. Update it when
-  behaviour changes.
+- `docs/architecture.md` is the starting point for the current component,
+  process, thread, and lock model. Update it when architecture changes.
+- `docs/actor-broker-handoff.md` is the historical design and validation
+  record: decisions, review findings, and their fixes.
 - `REVIEW.md` is the review brief: the concurrency invariants and the
   interleavings to trace. Reviews should cite its invariant numbers.
 - `docs/linux-validation.md` records the fault-matrix results and the accepted
