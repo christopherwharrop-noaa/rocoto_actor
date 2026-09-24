@@ -238,7 +238,7 @@ Inside an actor a handle supports `call` and `stop` only. `ask` returns a `Rocot
 
 `broker.describe` returns a plain-data snapshot for operators: broker counters (routes in flight, timers, queued lifecycle requests) and, per actor, its path, state, generation, pid, restart count, what it is waiting on, its watchers and timers, and its last exit reason and failure.
 
-The broker's own threads never die silently: a failure while running a route expiry, a scheduled task, or an actor's spawn/stop request is passed to the broker's `error_handler:` (a callable receiving the error and a short context string; the default writes one line to the application's standard error) and the thread carries on. Replace it to route these into your logging.
+The broker's own threads never die silently: a failure while running a route expiration, a scheduled task, or an actor's spawn/stop request is passed to the broker's `error_handler:` (a callable receiving the error and a short context string; the default writes one line to the application's standard error) and the thread carries on. Replace it to route these into your logging.
 
 Routing is bounded and does not create a thread per request. `RocotoActor::ActorBroker.new(max_routes: 1_000, max_routes_per_actor: 100)` limits requests awaiting a target across the broker and unwritten responses owed to one actor. A request beyond `max_routes` fails with `RocotoActor::BrokerBusyError`; an actor at `max_routes_per_actor` is not read from until its responses drain, without affecting other actors.
 

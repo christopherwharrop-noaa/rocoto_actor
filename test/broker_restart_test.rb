@@ -184,7 +184,7 @@ class BrokerRestartTest < BrokerTestCase
     assert_empty broker.roots
   end
 
-  def test_child_cleanup_after_a_failure_does_not_delay_route_expiries
+  def test_child_cleanup_after_a_failure_does_not_delay_route_expirations
     target = @broker.spawn(ExampleActor, "target")
     worker = @broker.spawn(ForwardingActor, target)
     parent = @broker.spawn(InitSpawnActor, 1, 2, name: "parent")
@@ -210,7 +210,7 @@ class BrokerRestartTest < BrokerTestCase
 
     assert_equal [[RuntimeError, "service task"]], reported
     error = assert_raises(RocotoActor::RemoteError) { worker.ask(message: :hang, timeout: 0.1).value(timeout: 2) }
-    assert_equal "RocotoActor::AskTimeoutError", error.remote_class # expiries still run
+    assert_equal "RocotoActor::AskTimeoutError", error.remote_class # expirations still run
   ensure
     broker&.stop(timeout: 2, force: true)
   end

@@ -20,7 +20,7 @@ class BrokerEventsTest < BrokerTestCase
     RocotoActor::Future.callback_error_handler = original
   end
 
-  def test_slow_on_event_does_not_delay_route_expiries
+  def test_slow_on_event_does_not_delay_route_expirations
     broker = RocotoActor::ActorBroker.new(on_event: ->(*) { sleep 1.5 })
     target = broker.spawn(ExampleActor, "target")
     worker = broker.spawn(ForwardingActor, target)
