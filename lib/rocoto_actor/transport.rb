@@ -30,7 +30,7 @@ module RocotoActor
       io.write([payload.bytesize].pack("N") << payload)
     end
 
-    def read(io, timeout: nil)
+    def read(io, timeout: nil, bindings: DecodeBindings.new)
       deadline = timeout && (monotonic_time + timeout)
       header = read_exactly(io, HEADER_SIZE, deadline: deadline)
       return if header.nil?
@@ -38,8 +38,7 @@ module RocotoActor
       size = header.unpack1("N")
       raise Error, "invalid frame size: #{size}" if size > MAX_FRAME_SIZE
 
-      Thread.current[:rocoto_actor_transport_socket] = io
-      decode(JSON.parse(read_exactly(io, size, deadline: deadline)))
+      decode(JSON.parse(read_exactly(io, size, deadline: deadline)), bindings)
     rescue JSON::JSONError => error
       raise SerializationError, error.message
     end
@@ -83,7 +82,7 @@ module RocotoActor
     end
     private_class_method :encode_container
 
-    def decode(value)
+    def decode(value, bindings)
       raise SerializationError, "invalid encoded value" unless value.is_a?(Array)
 
       type, payload = value
@@ -92,17 +91,11 @@ module RocotoActor
       when "boolean", "string", "float" then payload
       when "integer" then Integer(payload, 10)
       when "symbol" then payload.to_sym
-      when "actor_handle"
-        if RocotoActor.worker_process?
-          ActorHandle.new(payload, socket: Thread.current[:rocoto_actor_transport_socket])
-        else
-          ActorHandle.new(payload, broker: Thread.current[:rocoto_actor_broker])
-        end
-      when "timer"
-        Timer.new(payload, socket: RocotoActor.worker_process? ? Thread.current[:rocoto_actor_transport_socket] : nil)
-      when "array" then payload.map { |item| decode(item) }
+      when "actor_handle" then bindings.actor_handle(payload)
+      when "timer" then bindings.timer(payload)
+      when "array" then payload.map { |item| decode(item, bindings) }
       when "hash"
-        payload.to_h { |key, item| [decode(key), decode(item)] }
+        payload.to_h { |key, item| [decode(key, bindings), decode(item, bindings)] }
       else
         raise SerializationError, "unknown encoded type: #{type.inspect}"
       end

@@ -19,9 +19,10 @@ module RocotoActor
 
     def run_worker(socket)
       RocotoActor.worker_process!
+      decode_bindings = RocotoActor.broker_client(socket).decode_bindings
       require ENV.fetch("ROCOTO_ACTOR_SOURCE")
       actor_class = constantize(ENV.fetch("ROCOTO_ACTOR_CLASS"))
-      boot = Transport.read(socket)
+      boot = Transport.read(socket, bindings: decode_bindings)
       raise Error, "expected actor boot message" unless boot&.fetch(:op) == :boot
 
       boot_id = boot.fetch(:id)
@@ -40,7 +41,7 @@ module RocotoActor
     def run_actor(socket, actor)
       deferred = RocotoActor.broker_client(socket).deferred_frames
       loop do
-        request = deferred.shift || Transport.read(socket)
+        request = deferred.shift || Transport.read(socket, bindings: RocotoActor.broker_client(socket).decode_bindings)
         break unless request
 
         case request.fetch(:op)

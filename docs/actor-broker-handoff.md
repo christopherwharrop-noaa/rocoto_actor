@@ -95,7 +95,8 @@ The long-term preferred API is asynchronous `handle.ask`, returning a future tha
 - `lib/rocoto_actor/launcher.rb`: internal (`private_constant`) process launcher (`launch` returns `[reference, boot_future]`), startup error mapping, and process-group helpers used by `ActorBroker` and `Reference`.
 - `lib/rocoto_actor/runner.rb`: worker entry point; marks the worker process, builds the context from the boot message, marks the broker client ready after `:ready`, and runs the actor loop (`run_actor` drains deferred frames and flattens `RemoteError` provenance in `error_response`).
 - `lib/rocoto_actor/future.rb`: `on_resolve` callbacks and `expire` used by the broker to answer without a waiting thread.
-- `lib/rocoto_actor/transport.rb`: encodes handles as `['actor_handle', id]` and decodes them using the current transport thread's socket.
+- `lib/rocoto_actor/decode_bindings.rb`: explicitly binds decoded handles and timers to a broker, worker socket, or neither; no thread-local decode state.
+- `lib/rocoto_actor/transport.rb`: encodes handles as `['actor_handle', id]` and decodes capability values through explicit `DecodeBindings`.
 - `lib/rocoto_actor/reference.rb`: accepts broker requests from an actor and queues broker responses on the actor's existing writer, with an `on_done` callback per response for broker accounting.
 - `test/support/process_actor.rb`: contains `ForwardingActor` used by the broker test.
 - `test/support/supervisor_actor.rb`: `SupervisorActor`, `InitSpawnActor`, and `FailingInitSpawnActor` exercising `RocotoActor.context`.
@@ -210,7 +211,7 @@ Remove generated `Gemfile.lock` if it is untracked and was created only by local
 - Broker side: `Reference#read_replies` uses `Protocol.broker_request?` to forward broker operations to `ActorBroker#dispatch`, which takes the per-source response slot then routes `:broker_request` inline and queues `:broker_spawn`/`:broker_stop` on a lifecycle pool (`max_lifecycle_workers`, lazily started; `max_pending_lifecycle_requests` queue bound rejecting with `BrokerBusyError`). Spawn blocks up to `start_timeout`, so it must not run on a reader thread or the service thread.
 - The source node is found through `@node_ids_by_reference`; an unregistered source gets `Error("unknown source actor")`. `spawn_child` validates types and restricts `options` to `SPAWN_OPTIONS` with numeric values; `source` must be absolute.
 - Worker-side `handle.stop(timeout:, force:)` sends `:broker_stop`; the broker only allows stopping descendants of the requester (`descendant?`), else `Error("... is not a descendant of ...")`.
-- Handles decoded in the application bind to the owning broker (`Thread.current[:rocoto_actor_broker]`, set on the reference reader thread by `attach_broker`), so a handle returned from an actor's reply is a fully local handle. Decoding in a worker (`RocotoActor.worker_process?`) binds to the socket as before.
+- Handles decoded in the application bind through the `DecodeBindings` owned by that `Reference`; `attach_broker` attaches the broker to the same bindings object created before the reader starts. Worker decoding uses socket-bound bindings owned by the per-socket `BrokerClient`. A handle returned from an actor reply is therefore fully local without thread-local state.
 - `ActorBroker#stop` fails any queued lifecycle requests with `ActorStoppedError` and joins the lifecycle workers; a spawn in progress completes and is rejected at registration because the broker is stopped.
 
 ### Boot protocol (implemented)

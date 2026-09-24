@@ -59,6 +59,7 @@ module RocotoActor
       @exit_error = nil
       @exit_status = nil
       @exit_callbacks = []
+      @decode_bindings = DecodeBindings.new
       start_reaper
       @reader = Thread.new { read_replies }
       @reader.name = "rocoto-actor-reader-#{pid}" if @reader.respond_to?(:name=)
@@ -68,8 +69,7 @@ module RocotoActor
 
     def attach_broker(broker)
       @pending_mutex.synchronize { @broker = broker }
-      # Handles decoded from this actor's replies bind to the owning broker.
-      @reader[:rocoto_actor_broker] = broker
+      @decode_bindings.attach_broker(broker)
     end
 
     # Runs the block once on the reaper thread after the actor process has
@@ -260,7 +260,7 @@ module RocotoActor
     end
 
     def read_replies
-      while (reply = Transport.read(@socket))
+      while (reply = Transport.read(@socket, bindings: @decode_bindings))
         if Protocol.broker_request?(reply)
           broker = @pending_mutex.synchronize { @broker }
           if broker

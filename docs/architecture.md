@@ -80,6 +80,11 @@ actor's existing socket. `ActorContext` exposes child spawning, watching, and
 self-scheduling. `ActorHandle` and `Timer` are opaque IDs bound either to the
 application broker or to the worker's broker client.
 
+`DecodeBindings` explicitly tells `Transport` how to bind decoded handles and
+timers. Each `Reference` owns broker bindings created before its reader starts;
+each worker `BrokerClient` owns socket bindings for that incarnation. This is
+separate from `ActorContext` and uses no thread-local state.
+
 No socket descriptor or `Reference` crosses an actor boundary.
 
 ### `Transport` and `Future`
@@ -130,7 +135,7 @@ interleavings that reviews must preserve.
 | --- | --- |
 | Public API | `broker.rb`, `handle.rb`, `context.rb`, `timer.rb`, `future.rb` |
 | Connection and process lifecycle | `reference.rb`, `launcher.rb`, `runner.rb` |
-| Worker-to-broker protocol | `protocol.rb`, `broker_client.rb`, `transport.rb` |
+| Worker-to-broker protocol | `protocol.rb`, `decode_bindings.rb`, `broker_client.rb`, `transport.rb` |
 | Errors | `errors.rb` |
 | Routing tests | `test/broker_routing_test.rb` |
 | Hierarchy and shutdown tests | `test/broker_lifecycle_test.rb` |

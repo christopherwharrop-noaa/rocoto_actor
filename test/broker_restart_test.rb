@@ -14,6 +14,20 @@ class BrokerRestartTest < BrokerTestCase
     assert_equal "phoenix: back", actor.ask("back").value(timeout: 2)
   end
 
+  def test_handle_returned_by_a_restarted_actor_binds_to_the_broker
+    actor = @broker.spawn(SupervisorActor, name: "supervisor", restart: :on_failure, restart_backoff: 0.01)
+    first_handle = actor.ask(op: :handle).value(timeout: 2)
+    assert_equal actor, first_handle
+
+    assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+    wait_until { actor.state == :running && actor.generation == 2 }
+
+    restarted_handle = actor.ask(op: :handle).value(timeout: 2)
+
+    assert_equal actor, restarted_handle
+    assert_equal "supervisor: usable", restarted_handle.ask("usable").value(timeout: 2)
+  end
+
   def test_actor_killed_from_outside_is_restarted_under_its_policy
     actor = @broker.spawn(ExampleActor, "victim", name: "victim", restart: :on_failure, restart_backoff: 0.01)
     old_pid = actor.ask(:pid).value(timeout: 2)

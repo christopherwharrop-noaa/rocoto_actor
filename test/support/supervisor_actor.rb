@@ -10,6 +10,8 @@ class SupervisorActor
   end
 
   def receive(message)
+    exit! 3 if message == :crash
+
     return "supervisor: #{message}" unless message.is_a?(Hash)
 
     case message.fetch(:op)
