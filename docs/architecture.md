@@ -79,6 +79,15 @@ Owns one actor connection and process group:
 All mutable connection state is protected by one reference mutex. Callbacks
 run after that mutex is released.
 
+A connection has one phase that only moves forward:
+`open` (accepts requests) → `draining` (a graceful stop is in flight) →
+`terminating` (nothing more is written; pending futures are rejected) →
+`exited` (the watchdog process was reaped) → `gone` (the process group is
+confirmed absent). `enter(phase)` performs the shared shutdown work once;
+`force_stop`, `close_and_reap`, and `actor_exited` differ only in whether they
+kill the group and whether they wait for the reader to drain the watchdog's
+exit report.
+
 ### `Launcher` and `Runner`
 
 `Launcher` creates the socket pair, watchdog process, and parent-side

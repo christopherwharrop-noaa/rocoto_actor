@@ -155,7 +155,7 @@ class RocotoActorTest < Minitest::Test
     @actor.ask(:hang)
     first_stop = Thread.new { @actor.stop(timeout: 0.2) }
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
-    until @actor.instance_variable_get(:@stopped)
+    until @actor.instance_variable_get(:@phase) != :open
       raise "stop did not start" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
       Thread.pass
