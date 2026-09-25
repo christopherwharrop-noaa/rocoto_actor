@@ -15,7 +15,7 @@ module RocotoActor
       warn "rocoto_actor: #{context}: #{error.class}: #{error.message}"
     end
 
-    TimerRecord = Struct.new(:id, :node_id, :generation, :message, :every)
+    TimerRecord = Struct.new(:id, :message, :every)
 
     # max_routes bounds brokered requests awaiting a target actor across the broker.
     # max_routes_per_actor bounds the broker responses owed to one source actor that
@@ -49,7 +49,6 @@ module RocotoActor
       @error_handler = error_handler
       @on_event = on_event
       @waiting = {} # node id => id of the node it is blocked on (a call or a child's boot)
-      @timers = {} # id => TimerRecord; an actor's timers die with its incarnation
       @mutex = Mutex.new
       @capacity_condition = ConditionVariable.new
       @nodes = {}
@@ -95,7 +94,7 @@ module RocotoActor
         {
           stopped: @stopped,
           routes_in_flight: @routes,
-          timers: @timers.size,
+          timers: @nodes.values.sum { |node| node.timers.size },
           lifecycle_queue: @lifecycle_executor.pending_requests,
           actors: @nodes.values.map { |node| describe_node(node) }
         }
@@ -243,10 +242,9 @@ module RocotoActor
         watched = @nodes[request[:handle_id]] or raise Error, "unknown actor handle"
         if watched.terminal?
           detail = { reason: watched.failure&.message || watched.exit&.to_s, generation: watched.generation }
-          @event_dispatcher.emit(watched.id, watched.state, detail, terminal: false, watcher_ids: [watcher.id],
-                                                                    notify_application: false)
+          @event_dispatcher.emit(watched.id, watched.state, detail, [watcher.id], notify_application: false)
         else
-          @event_dispatcher.watch(watched.id, watcher.id)
+          watched.watchers[watcher.id] = true
         end
       end
       respond(source, request[:request_id], true, release_response)
@@ -257,7 +255,8 @@ module RocotoActor
     def unwatch(source, request, release_response)
       removed = @mutex.synchronize do
         watcher = node_for(source)
-        watcher && @event_dispatcher.remove_watch(request[:handle_id], watcher.id)
+        watched = @nodes[request[:handle_id]]
+        watcher && watched ? !watched.watchers.delete(watcher.id).nil? : false
       end
       respond(source, request[:request_id], removed, release_response)
     rescue StandardError => error
@@ -265,10 +264,10 @@ module RocotoActor
     end
 
     # Caller holds @mutex. Queues delivery of a lifecycle event to the
-    # application's on_event and to every watcher; a terminal event ends the
-    # watches. Delivery runs on the event thread, outside every lock.
-    def emit(node, event, reason)
-      @event_dispatcher.emit(node.id, event, { reason: reason, generation: node.generation }, terminal: node.terminal?)
+    # application's on_event and to every watcher of the node. Delivery runs on
+    # the event thread, outside every lock.
+    def emit(node, event, reason, watcher_ids = node.watchers.keys)
+      @event_dispatcher.emit(node.id, event, { reason: reason, generation: node.generation }, watcher_ids)
     end
 
     # Caller holds @mutex. Why the incarnation behind this reference ended, or
@@ -296,9 +295,12 @@ module RocotoActor
       end
     end
 
-    # Caller holds @mutex. Ends every watch held by this incarnation.
-    def purge_watches(node)
-      @event_dispatcher.purge(node.id)
+    # Caller holds @mutex. Ends what only this incarnation of the node holds:
+    # its timers, the watches it placed on others, and any call it was blocked
+    # in. Others' watches on the node itself persist across a restart.
+    def release_incarnation(node)
+      node.timers.clear
+      @nodes.each_value { |other| other.watchers.delete(node.id) }
       @waiting.delete(node.id)
     end
 
@@ -313,17 +315,18 @@ module RocotoActor
         raise ArgumentError, "every must be at least #{MIN_TIMER_INTERVAL} seconds"
       end
 
-      timer = @mutex.synchronize do
+      node, timer = @mutex.synchronize do
         node = source_node(source)
-        if @timers.count { |_id, record| record.node_id == node.id } >= MAX_TIMERS_PER_ACTOR
-          raise Error, "actor #{node.path} already has #{MAX_TIMERS_PER_ACTOR} timers"
+        if node.timers.size >= MAX_TIMERS_PER_ACTOR
+          raise Error,
+                "actor #{node.path} already has #{MAX_TIMERS_PER_ACTOR} timers"
         end
 
-        record = TimerRecord.new(SecureRandom.hex(16), node.id, node.generation, request[:message], every)
-        @timers[record.id] = record
-        record
+        record = TimerRecord.new(SecureRandom.hex(16), request[:message], every)
+        node.timers[record.id] = record
+        [node, record]
       end
-      enqueue_task(delay: after || every) { fire_timer(timer.id) }
+      enqueue_task(delay: after || every) { fire_timer(node, timer.id) }
       respond(source, request[:request_id], Timer.new(timer.id), release_response)
     rescue StandardError => error
       respond_error(source, request[:request_id], error, release_response)
@@ -332,10 +335,7 @@ module RocotoActor
     def cancel_timer(source, request, release_response)
       cancelled = @mutex.synchronize do
         node = node_for(source)
-        record = @timers[request[:timer_id]]
-        next false unless node && record && record.node_id == node.id
-
-        !@timers.delete(record.id).nil?
+        node ? !node.timers.delete(request[:timer_id]).nil? : false
       end
       respond(source, request[:request_id], cancelled, release_response)
     rescue StandardError => error
@@ -343,35 +343,29 @@ module RocotoActor
     end
 
     # Runs on the service thread. Delivers the timer's message as a tell from
-    # the actor to itself, then re-arms a recurring timer. A timer whose actor
-    # incarnation is gone has already been purged; a tell that fails is
-    # reported and, for a recurring timer, tried again next interval.
-    def fire_timer(id)
-      record, reference, sender = @mutex.synchronize do
-        record = @timers[id]
-        next [nil, nil, nil] unless record
+    # the actor to itself, then re-arms a recurring timer. A timer whose
+    # incarnation has ended is no longer in node.timers and does nothing. A
+    # tell that fails is reported, except when the actor has just stopped,
+    # which its lifecycle event already reports; a recurring timer tries again
+    # next interval either way.
+    def fire_timer(node, id)
+      record, reference = @mutex.synchronize do
+        record = node.timers[id]
+        next [nil, nil] unless record && node.active?
 
-        node = @nodes[record.node_id]
-        unless node && node.generation == record.generation && node.active?
-          @timers.delete(id)
-          next [nil, nil, nil]
-        end
-        @timers.delete(id) unless record.every
-        [record, node.reference, ActorHandle.new(node.id, broker: self)]
+        node.timers.delete(id) unless record.every
+        [record, node.reference]
       end
       return unless record
 
       begin
-        reference.tell(record.message, sender)
+        reference.tell(record.message, ActorHandle.new(node.id, broker: self))
+      rescue ActorStoppedError
+        nil
       rescue StandardError => error
-        report_error(error, "scheduled tell to #{sender.id}")
+        report_error(error, "scheduled tell to #{node.id}")
       end
-      enqueue_task(delay: record.every) { fire_timer(id) } if record.every
-    end
-
-    # Caller holds @mutex. Drops every timer of the node's current incarnation.
-    def purge_timers(node)
-      @timers.delete_if { |_id, record| record.node_id == node.id }
+      enqueue_task(delay: record.every) { fire_timer(node, id) } if record.every
     end
 
     def non_negative_number?(value)
@@ -637,11 +631,11 @@ module RocotoActor
     # only a live actor needs: the reference (threads, socket) and the relaunch
     # spec. The node itself stays so its handle keeps answering with its state.
     def retire(node, state)
-      purge_timers(node)
-      purge_watches(node)
+      release_incarnation(node)
       reason = exit_reason(node.reference)
-      node.retire(state)
-      emit(node, state, reason)
+      watcher_ids = node.watchers.keys
+      node.retire(state) # clears the node's own watchers: a terminal event ends them
+      emit(node, state, reason, watcher_ids)
     end
 
     # Caller holds @mutex.
@@ -649,8 +643,8 @@ module RocotoActor
       {
         id: node.id, path: node.path, name: node.name, state: node.state, generation: node.generation,
         parent_id: node.parent_id, children: node.children.dup, pid: node.reference&.pid,
-        restarts: node.restarts, waiting_on: @waiting[node.id], watchers: @event_dispatcher.watcher_ids(node.id),
-        timers: @timers.count { |_id, record| record.node_id == node.id },
+        restarts: node.restarts, waiting_on: @waiting[node.id], watchers: node.watchers.keys,
+        timers: node.timers.size,
         last_exit: (node.reference&.exit_status || node.exit)&.to_s,
         last_failure: (node.reference&.exit_error || node.failure)&.message
       }
@@ -727,8 +721,7 @@ module RocotoActor
         live_postorder(node).each { |descendant| descendant.begin_stopping unless descendant.equal?(node) }
         live = node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
         delay = restart_delay(node)
-        purge_timers(node)
-        purge_watches(node)
+        release_incarnation(node)
         if delay
           node.begin_restarting
           emit(node, :restarting, exit_reason(node.reference))
@@ -775,7 +768,6 @@ module RocotoActor
       installed = @mutex.synchronize do
         next false unless node.state == :restarting
 
-        purge_watches(node)
         node.install_restarted_reference(reference)
         reference.actor_id = node.id
         true

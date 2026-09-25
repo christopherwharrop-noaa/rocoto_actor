@@ -32,15 +32,31 @@ class ActorNodeTest < Minitest::Test
     assert @node.booting
   end
 
+  def test_restarting_drops_timers_but_keeps_watchers
+    @node.boot_succeeded(0)
+    @node.timers["t"] = :record
+    @node.watchers["w"] = true
+
+    @node.begin_restarting
+
+    assert_empty @node.timers
+    assert_equal ["w"], @node.watchers.keys
+  end
+
   def test_retirement_releases_live_resources_and_preserves_diagnostics
     error = RuntimeError.new("failed")
     status = Object.new
     @reference.exit_error = error
     @reference.exit_status = status
 
+    @node.timers["t"] = :record
+    @node.watchers["w"] = true
+
     @node.retire(:failed)
 
     assert_equal :failed, @node.state
+    assert_empty @node.timers, "timers die with the incarnation"
+    assert_empty @node.watchers, "a terminal node has no watchers left to notify"
     assert_nil @node.reference
     assert_nil @node.spec
     assert_same error, @node.failure

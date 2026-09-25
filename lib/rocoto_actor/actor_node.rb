@@ -10,6 +10,10 @@ module RocotoActor
 
     attr_reader :id, :name, :path, :generation, :parent_id, :children, :state, :reference,
                 :booting, :spec, :policy, :restarts, :failure, :exit, :boot_exit, :started_at
+    # Timers this incarnation scheduled (id => record) and the ids of actors
+    # watching this node. Timers die with the incarnation; watchers persist
+    # across restarts and end when the node goes terminal.
+    attr_reader :timers, :watchers
 
     def initialize(id:, name:, path:, parent_id:, reference:, spec:, policy:)
       @id = id
@@ -28,6 +32,8 @@ module RocotoActor
       @exit = nil
       @boot_exit = nil
       @started_at = nil
+      @timers = {}
+      @watchers = {}
     end
 
     def terminal?
@@ -60,6 +66,7 @@ module RocotoActor
 
     def begin_restarting
       @state = :restarting
+      @timers.clear
     end
 
     def record_restart_attempt(now, window)
@@ -95,6 +102,8 @@ module RocotoActor
       @reference = nil
       @spec = nil
       @restarts = 0
+      @timers.clear
+      @watchers.clear
     end
 
     private
