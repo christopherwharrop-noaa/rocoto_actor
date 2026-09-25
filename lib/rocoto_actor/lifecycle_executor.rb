@@ -37,6 +37,10 @@ module RocotoActor
       end
     end
 
+    def pending_requests
+      @mutex.synchronize { @queue.count { |job| job.is_a?(Request) } }
+    end
+
     def enqueue_job(&block)
       @mutex.synchronize do
         return false if @stopped

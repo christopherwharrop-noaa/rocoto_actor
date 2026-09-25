@@ -17,16 +17,17 @@ module RocotoActor
       fields.merge(request_id: request_id)
     end
 
-    def success(id, result = nil, operation: nil)
-      envelope = { id: id, ok: true, result: result }
-      envelope[:op] = operation if operation
-      envelope
+    def success(id, result = nil)
+      { id: id, ok: true, result: result }
     end
 
-    def failure(id, error, operation: nil)
-      envelope = { id: id, ok: false, **error_fields(error) }
-      envelope[:op] = operation if operation
-      envelope
+    def failure(id, error)
+      { id: id, ok: false, **error_fields(error) }
+    end
+
+    # An actor reporting the exception that is ending it, with no request to answer.
+    def actor_error(error)
+      request(:actor_error, **error_fields(error))
     end
 
     def broker_response(request_id, result: nil, error: nil)

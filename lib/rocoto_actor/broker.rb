@@ -9,20 +9,12 @@ module RocotoActor
     DEFAULT_ROUTE_TIMEOUT = 30
     DEFAULT_MAX_LIFECYCLE_WORKERS = 2
     DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS = 100
-    EVENTS = %i[failed restarting restarted stopped].freeze
     MAX_TIMERS_PER_ACTOR = 100
     MIN_TIMER_INTERVAL = 0.01
-    SPAWN_OPTIONS = ActorContext::SPAWN_OPTIONS
-    STATES = ActorNode::STATES
-    TERMINAL_STATES = ActorNode::TERMINAL_STATES
-    # States in which the actor's process may issue broker requests; a
-    # :restarting node is only reachable while its relaunch is booting.
-    ACTIVE_STATES = ActorNode::ACTIVE_STATES
     RESTART_POLICIES = %i[never on_failure].freeze
     DEFAULT_MAX_RESTARTS = 3
     DEFAULT_RESTART_WINDOW = 60
     DEFAULT_RESTART_BACKOFF = 0.1
-    POLICY_OPTIONS = %i[restart max_restarts restart_window restart_backoff].freeze
     DEFAULT_ERROR_HANDLER = lambda do |error, context|
       warn "rocoto_actor: #{context}: #{error.class}: #{error.message}"
     end
@@ -116,7 +108,7 @@ module RocotoActor
           stopped: @stopped,
           routes_in_flight: @routes,
           timers: @timers.size,
-          lifecycle_queue: 0,
+          lifecycle_queue: @lifecycle_executor.pending_requests,
           actors: @nodes.values.map { |node| describe_node(node) }
         }
       end
@@ -461,8 +453,6 @@ module RocotoActor
     # the caller must settle the boot future exactly once.
     def launch_node(actor_class, arguments, parent_id:, name:, options:, start_timeout:, policy:)
       name = validate_name(name)
-      @mutex.synchronize { check_placement(parent_id, name) }
-
       id = SecureRandom.hex(16)
       reference, boot = Launcher.launch(actor_class, *arguments, context: { actor_id: id }, **options)
       spec = { actor_class: actor_class, arguments: arguments, options: options, start_timeout: start_timeout }
@@ -561,7 +551,7 @@ module RocotoActor
       raise ArgumentError, "arguments must be an array" unless arguments.is_a?(Array)
       raise ArgumentError, "options must be a hash" unless options.is_a?(Hash)
 
-      unknown = options.keys - SPAWN_OPTIONS
+      unknown = options.keys - ActorContext::SPAWN_OPTIONS
       raise ArgumentError, "unsupported spawn options: #{unknown.join(', ')}" unless unknown.empty?
 
       options = options.dup

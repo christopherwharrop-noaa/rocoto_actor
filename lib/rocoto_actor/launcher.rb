@@ -65,17 +65,6 @@ module RocotoActor
       raise
     end
 
-    # Launches and waits for the actor to become ready. Used by low-level tests;
-    # the broker uses launch so that the actor is registered while it boots.
-    def spawn(actor_class, *, start_timeout: START_TIMEOUT, **)
-      reference, boot = launch(actor_class, *, **)
-      boot.value(timeout: start_timeout)
-      reference
-    rescue StandardError => error
-      reference&.stop(force: true, timeout: 0)
-      raise startup_error(reference, error)
-    end
-
     # Maps a boot future's failure to the error the spawner sees.
     def startup_error(reference, error)
       return error unless reference
