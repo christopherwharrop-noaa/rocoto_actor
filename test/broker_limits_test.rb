@@ -2,6 +2,8 @@
 
 require_relative "support/broker_test_case"
 require_relative "support/supervisor_actor"
+require_relative "support/ticker_actor"
+require_relative "support/process_actor"
 
 # Behaviour near the user's process limit (RLIMIT_NPROC): refusing to spawn
 # before the limit is hit, and never letting thread-creation failures escape
@@ -12,6 +14,10 @@ class BrokerLimitsTest < BrokerTestCase
   DEADLINE_SCHEDULER = RocotoActor.const_get(:DeadlineScheduler)
   EVENT_DISPATCHER = RocotoActor.const_get(:EventDispatcher)
   NEAR_LIMIT = { limit: 100, in_use: 70, margin: 32 }.freeze # 70 + 7 + 32 > 100
+  # Minitest's stub yields to a block passed to the stubbed method even when
+  # given a plain value; the executors return false *without* running the
+  # block when no thread is available, so the stand-in must not run it either.
+  NO_THREAD = ->(*, &_block) { false }
 
   def test_spawn_is_refused_when_one_more_actor_would_not_fit
     supervisor = @broker.spawn(SupervisorActor, name: "sup")
@@ -65,6 +71,74 @@ class BrokerLimitsTest < BrokerTestCase
     broker&.stop(timeout: 2, force: true)
   end
 
+  def test_relaunch_that_cannot_be_queued_fails_the_actor_instead_of_stranding_it
+    reported = Queue.new
+    broker = RocotoActor::ActorBroker.new(error_handler: ->(error, context) { reported << [error.class, context] })
+    actor = broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, max_restarts: 2, restart_backoff: 0.01)
+
+    broker.instance_variable_get(:@lifecycle_executor).stub(:enqueue_job, NO_THREAD) do
+      assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+      wait_until { actor.state == :failed }
+    end
+
+    assert_equal 1, actor.generation
+  ensure
+    broker&.stop(timeout: 2, force: true)
+  end
+
+  def test_children_are_stopped_inline_when_no_lifecycle_thread_is_available
+    parent = @broker.spawn(ExampleActor, "parent", name: "parent")
+    child = @broker.spawn(ExampleActor, "child", name: "child", parent: parent)
+
+    @broker.instance_variable_get(:@lifecycle_executor).stub(:enqueue_job, NO_THREAD) do
+      assert_raises(RocotoActor::ActorStoppedError) { parent.ask(:crash).value(timeout: 2) }
+      wait_until { parent.state == :failed && child.state == :stopped }
+    end
+
+    refute child.alive?
+  end
+
+  def test_a_boot_or_call_that_cannot_be_timed_fails_instead_of_waiting
+    scheduler = @broker.instance_variable_get(:@scheduler)
+    scheduler.stub(:schedule_expiration, NO_THREAD) do
+      error = assert_raises(RocotoActor::ResourceLimitError) { @broker.spawn(ExampleActor, "x", name: "x") }
+      assert_match(/time the boot/, error.message)
+
+      remote = assert_raises(RocotoActor::RemoteError) { @worker.ask("hello").value(timeout: 2) }
+      assert_equal "RocotoActor::ResourceLimitError", remote.remote_class
+    end
+
+    assert_equal "database: fine", @database.ask("fine").value(timeout: 1)
+    assert_equal 0, @broker.describe[:routes_in_flight]
+  end
+
+  def test_root_is_exempt_from_the_preflight
+    Process.stub(:uid, 0) { assert_nil PROCESS_BUDGET.snapshot(32) }
+    Process.stub(:euid, 0) { assert_nil PROCESS_BUDGET.snapshot(32) }
+  end
+
+  def test_work_racing_broker_stop_fails_as_stopped_not_as_a_resource_limit
+    reported = []
+    broker = RocotoActor::ActorBroker.new(error_handler: ->(error, context) { reported << [error.class, context] })
+    target = broker.spawn(ExampleActor, "target")
+    worker = broker.spawn(ForwardingActor, target)
+    ticker = broker.spawn(TickerActor, name: "ticker")
+    ticker.ask(op: :schedule, name: :beat, every: 0.02).value(timeout: 2)
+
+    broker.instance_variable_get(:@scheduler).stop # as broker.stop does, before the actors are retired
+    remote = assert_raises(RocotoActor::RemoteError) { worker.ask("hello").value(timeout: 2) }
+    assert_equal "RocotoActor::ActorStoppedError", remote.remote_class
+    timer = assert_raises(RocotoActor::RemoteError) do
+      ticker.ask(op: :schedule, name: :late, after: 1).value(timeout: 2)
+    end
+    assert_equal "RocotoActor::ActorStoppedError", timer.remote_class
+    sleep 0.1
+
+    assert_empty reported, "a timer caught by shutdown is not a resource-limit failure"
+  ensure
+    broker&.stop(timeout: 2, force: true)
+  end
+
   def test_lifecycle_executor_fails_a_request_it_cannot_start_a_thread_for
     reported = []
     executor = LIFECYCLE_EXECUTOR.new(max_workers: 1, max_pending_requests: 10,
@@ -89,14 +163,27 @@ class BrokerLimitsTest < BrokerTestCase
     scheduler = DEADLINE_SCHEDULER.new(error_handler: handler)
     dispatcher = EVENT_DISPATCHER.new(error_handler: handler) { |*| nil }
 
-    Thread.stub(:new, ->(*) { raise ThreadError, "simulated" }) do
-      scheduler.enqueue { nil }
-      dispatcher.emit("id", :stopped, {}, [])
+    armed = Thread.stub(:new, ->(*) { raise ThreadError, "simulated" }) do
+      [scheduler.enqueue { nil }, scheduler.schedule_expiration(:key, 1) { nil }].tap do
+        dispatcher.emit("id", :stopped, {}, [])
+      end
     end
 
-    assert_equal [[ThreadError, "starting the scheduler thread"], [ThreadError, "starting the event thread"]], reported
+    assert_equal [false, false], armed
+    assert_equal ([[ThreadError, "starting the scheduler thread"]] * 2) + [[ThreadError, "starting the event thread"]],
+                 reported
   ensure
     scheduler&.stop
     dispatcher&.stop
+  end
+
+  def test_scheduler_survives_an_error_handler_that_raises
+    scheduler = DEADLINE_SCHEDULER.new(error_handler: ->(*) { raise "handler bug" })
+
+    armed = Thread.stub(:new, ->(*) { raise ThreadError, "simulated" }) { scheduler.enqueue { nil } }
+
+    assert_equal false, armed
+  ensure
+    scheduler&.stop
   end
 end

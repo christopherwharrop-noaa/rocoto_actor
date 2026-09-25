@@ -159,6 +159,8 @@ module RocotoActor
       wait_for_exit(kill_deadline(deadline))
     end
 
+    # A query only. Without a reaper thread (RLIMIT_NPROC), an exit is observed
+    # at the next stop or wait rather than here.
     def alive?
       @pending_mutex.synchronize do
         return false if reached?(:gone)
@@ -226,6 +228,11 @@ module RocotoActor
       @socket.close unless @socket.closed?
     rescue IOError
       nil
+    end
+
+    # Kills the process group without waiting for it to be gone. Idempotent.
+    def kill
+      force_stop
     end
 
     # Kills the process group now. Idempotent; always ensures a reaper exists.
@@ -383,9 +390,23 @@ module RocotoActor
         @reaper.name = "rocoto-actor-reaper-#{@pid}" if @reaper.respond_to?(:name=)
       end
     rescue ThreadError
-      # No thread to reap with (RLIMIT_NPROC): the exit goes unobserved until a
-      # later stop retries here; wait_for_exit then reports false at its deadline.
+      # No thread to reap with (RLIMIT_NPROC): the next alive?, stop, or exit
+      # path retries here, and reap_without_reaper polls in the meantime.
       nil
+    end
+
+    # With no reaper thread the exit must be observed by whoever waits for it:
+    # poll waitpid instead of the exit condition so a killed process is reaped
+    # (releasing its process slot) and its exit is delivered to the broker.
+    def reaper?
+      start_reaper
+      @reaper_mutex.synchronize { !@reaper.nil? }
+    end
+
+    def reap_now
+      actor_exited if Process.waitpid(@pid, Process::WNOHANG)
+    rescue Errno::ECHILD
+      actor_exited
     end
 
     # Runs once on the reaper thread after the watchdog process is reaped.
@@ -417,12 +438,23 @@ module RocotoActor
     end
 
     def wait_for_exit(deadline)
+      polling = !reaper?
       @pending_mutex.synchronize do
         until reached?(:exited)
           remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
           return false if remaining <= 0
 
-          @exit_condition.wait(@pending_mutex, remaining)
+          if polling
+            @pending_mutex.unlock
+            begin
+              reap_now
+              sleep 0.01
+            ensure
+              @pending_mutex.lock
+            end
+          else
+            @exit_condition.wait(@pending_mutex, remaining)
+          end
         end
       end
       while Launcher.process_group_alive?(@pid)

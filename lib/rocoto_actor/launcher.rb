@@ -94,10 +94,24 @@ module RocotoActor
         nil
       end
     rescue ThreadError
-      Process.waitpid(pid, Process::WNOHANG) # best effort without a thread to reap with
+      reap_without_thread(pid)
+    end
+
+    # KILL is delivered asynchronously, so poll briefly rather than once; a
+    # process that cannot die within the window stays a zombie until the
+    # application exits, which is the best a caller with no threads can do.
+    def reap_without_thread(pid, patience: 1.0)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + patience
+      until Process.waitpid(pid, Process::WNOHANG)
+        return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        sleep 0.01
+      end
+      nil
     rescue Errno::ECHILD
       nil
     end
+    private_class_method :reap_without_thread
 
     def signal_process_group(pid, signal)
       Process.kill(signal, -pid)
