@@ -32,6 +32,22 @@ class ActorNodeTest < Minitest::Test
     assert @node.booting
   end
 
+  def test_a_relaunch_boots_back_to_running_unless_a_stop_won
+    fake_reference = -> { Struct.new(:exit_error, :exit_status).new(nil, nil) }
+    @node.boot_succeeded(0)
+    @node.begin_restarting
+    @node.install_restarted_reference(fake_reference.call)
+    assert @node.boot_succeeded(5.0)
+    assert_equal :running, @node.state
+    refute @node.first_boot?
+
+    @node.begin_restarting
+    @node.install_restarted_reference(fake_reference.call)
+    @node.begin_stopping
+    refute @node.boot_succeeded(6.0), "a stop that raced the boot keeps the node stopping"
+    assert_equal :stopping, @node.state
+  end
+
   def test_restarting_drops_timers_but_keeps_watchers
     @node.boot_succeeded(0)
     @node.timers["t"] = :record

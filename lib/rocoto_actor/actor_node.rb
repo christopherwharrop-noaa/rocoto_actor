@@ -44,12 +44,19 @@ module RocotoActor
       ACTIVE_STATES.include?(@state)
     end
 
+    # Ends a boot (first or relaunch) successfully. Returns true when the node
+    # moved to :running, false when a stop raced the boot and won.
     def boot_succeeded(now)
       @booting = false
-      return unless @state == :starting
+      return false unless %i[starting restarting].include?(@state)
 
       @state = :running
       @started_at = now
+      true
+    end
+
+    def first_boot?
+      @generation == 1
     end
 
     def boot_failed
@@ -86,14 +93,6 @@ module RocotoActor
       @generation += 1
       @booting = true
       true
-    end
-
-    def restart_succeeded(now)
-      @booting = false
-      return unless @state == :restarting
-
-      @state = :running
-      @started_at = now
     end
 
     def retire(state)

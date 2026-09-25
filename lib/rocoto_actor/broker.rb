@@ -78,12 +78,11 @@ module RocotoActor
     def spawn(actor_class, *arguments, name: nil, parent: nil, **options)
       spawn_options = SpawnOptions.parse(options)
       node, boot = launch_node(actor_class, arguments, parent_id: parent&.id, name: name, options: spawn_options)
-      begin
-        boot.value(timeout: spawn_options.start_timeout)
-      rescue StandardError => error
-        raise settle_boot(node, error)
-      end
-      settle_boot(node, nil)
+      settled = Queue.new
+      await_boot(node, boot, spawn_options.start_timeout) { |error| settled << error }
+      error = settled.pop
+      raise error if error
+
       ActorHandle.new(node.id, broker: self)
     end
 
@@ -439,19 +438,36 @@ module RocotoActor
       raise
     end
 
-    # Moves a booted node to :running, or on failure kills the process,
-    # unregisters the node, and stops any children it spawned while booting.
-    # Returns the error to raise or send.
-    def settle_boot(node, error)
-      children, exited, reference = @mutex.synchronize do
-        next [[], false, nil] unless node.booting
+    # Arms the boot deadline and settles the node exactly once when its boot
+    # future resolves, on whichever thread resolves it. The block receives the
+    # error to raise or send, or nil on success.
+    def await_boot(node, boot, start_timeout)
+      schedule_expiration(boot, start_timeout)
+      boot.on_resolve do |_result, error|
+        cancel_expiration(boot)
+        yield settle(node, error)
+      end
+    end
 
+    # Ends a boot, first or relaunch. Success moves the node to :running (and
+    # announces a relaunch). Failure kills the process; a first boot is then
+    # unregistered with any children it spawned while booting, while a failed
+    # relaunch counts as another failure under the restart policy. Returns the
+    # error a spawner should see, or nil.
+    def settle(node, error)
+      first_boot, children, exited, reference = @mutex.synchronize do
+        next [nil, [], false, nil] unless node.booting
+
+        first_boot = node.first_boot?
         if error
           node.boot_failed
-          [node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, node.reference]
+          [first_boot, node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, node.reference]
         else
-          node.boot_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC))
-          [[], node.boot_exit.equal?(node.reference), nil]
+          if node.boot_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC)) && !first_boot
+            emit(node, :restarted,
+                 nil)
+          end
+          [first_boot, [], node.boot_exit.equal?(node.reference), nil]
         end
       end
       # The process died after replying ready but before we settled: the actor
@@ -460,9 +476,14 @@ module RocotoActor
       return nil unless error
 
       reference&.stop(force: true, timeout: 0)
-      unregister(node)
-      stop_later(children)
-      Launcher.startup_error(reference, error)
+      if first_boot
+        unregister(node)
+        stop_later(children)
+        Launcher.startup_error(reference, error)
+      else
+        actor_failed(node)
+        nil
+      end
     end
 
     # Removes a node that never finished booting; its id is known only to the
@@ -530,11 +551,8 @@ module RocotoActor
       node, boot = launch_node(actor_class, arguments, parent_id: parent.id, name: request[:name],
                                                        options: spawn_options)
       @mutex.synchronize { @waiting[parent.id] = node.id } # the parent blocks in context.spawn until the boot settles
-      schedule_expiration(boot, spawn_options.start_timeout)
-      boot.on_resolve do |_result, error|
-        cancel_expiration(boot)
+      await_boot(node, boot, spawn_options.start_timeout) do |error|
         @mutex.synchronize { @waiting.delete(parent.id) if @waiting[parent.id] == node.id }
-        error = settle_boot(node, error)
         if error
           respond_error(source, request[:request_id], error, release_response)
         else
@@ -779,32 +797,8 @@ module RocotoActor
 
       reference.attach_broker(self)
       reference.on_exit { actor_exited(node, reference) }
-      schedule_expiration(boot, spec[:start_timeout])
-      boot.on_resolve do |_result, error|
-        cancel_expiration(boot)
-        settle_restart(node, error)
-      end
+      await_boot(node, boot, spec[:start_timeout]) { |_error| nil }
     rescue StandardError
-      actor_failed(node)
-    end
-
-    # A failed relaunch counts as another failure under the same policy.
-    def settle_restart(node, error)
-      kill, exited, reference = @mutex.synchronize do
-        next [false, false, nil] unless node.booting
-
-        if node.state == :restarting && error.nil?
-          node.restart_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC))
-          emit(node, :restarted, nil)
-        elsif error
-          node.boot_failed
-        end
-        [!error.nil?, error.nil? && node.boot_exit.equal?(node.reference), node.reference]
-      end
-      return actor_failed(node) if exited
-      return unless kill
-
-      reference&.stop(force: true, timeout: 0)
       actor_failed(node)
     end
 

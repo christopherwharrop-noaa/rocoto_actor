@@ -49,3 +49,4 @@ Naming/PredicateMethod:
     - stop_subtrees
     - expire
     - wait_for_exit
+    - boot_succeeded
