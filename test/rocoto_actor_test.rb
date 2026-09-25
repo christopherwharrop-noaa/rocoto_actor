@@ -290,6 +290,16 @@ class RocotoActorTest < Minitest::Test
     assert_operator elapsed, :<, 1
   end
 
+  def test_failed_spawn_is_reaped_without_a_thread_to_reap_with
+    pid = Process.spawn(RbConfig.ruby, "-e", "sleep 30", pgroup: true)
+
+    Thread.stub(:new, ->(*) { raise ThreadError, "simulated" }) do
+      LaunchHelper::LAUNCHER.terminate_process_group(pid)
+    end
+
+    assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
+  end
+
   def test_actor_exits_when_parent_dies_even_if_parent_socket_was_inherited
     reader, writer = IO.pipe
     owner_pid = fork do

@@ -160,6 +160,7 @@ module RocotoActor
     end
 
     def alive?
+      reap_without_reaper
       @pending_mutex.synchronize do
         return false if reached?(:gone)
 
@@ -383,9 +384,22 @@ module RocotoActor
         @reaper.name = "rocoto-actor-reaper-#{@pid}" if @reaper.respond_to?(:name=)
       end
     rescue ThreadError
-      # No thread to reap with (RLIMIT_NPROC): the exit goes unobserved until a
-      # later stop retries here; wait_for_exit then reports false at its deadline.
+      # No thread to reap with (RLIMIT_NPROC): the next alive?, stop, or exit
+      # path retries here, and reap_without_reaper polls in the meantime.
       nil
+    end
+
+    # Without a reaper thread the exit would go unobserved; callers of alive?
+    # poll for it instead so the broker still learns that the actor died.
+    def reap_without_reaper
+      return if @reaper_mutex.synchronize { @reaper }
+
+      start_reaper
+      return if @reaper_mutex.synchronize { @reaper }
+
+      actor_exited if Process.waitpid(@pid, Process::WNOHANG)
+    rescue Errno::ECHILD
+      actor_exited
     end
 
     # Runs once on the reaper thread after the watchdog process is reaped.

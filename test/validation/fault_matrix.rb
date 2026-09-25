@@ -593,11 +593,15 @@ class FaultMatrix
                          message: error&.message.to_s[0, 80], reported: reported.uniq.first(3))
     RUBY
     output, status = limited("--nproc=#{threshold + 40}:#{threshold + 40}", script, allow_hang: true)
-    if status.exitstatus == 137
-      raise Note, "Ruby wedged in a futex when thread creation hit RLIMIT_NPROC (#{threshold + 40}) and " \
-                  "ignored TERM; KILL removed it. Deployment must keep process limits above need; " \
-                  "the library cannot recover a wedged VM."
+    # GNU timeout exits 124 when its limit expires (137 if the shell reports the KILL instead).
+    if [124, 137].include?(status.exitstatus)
+      raise Note, "Ruby wedged when thread creation hit RLIMIT_NPROC (#{threshold + 40}): no output for 30s, " \
+                  "KILL removed it. The preflight exists to avoid this; the library cannot recover a wedged VM."
     end
+    if output.strip.empty? && !status.success?
+      raise Note, "Ruby exited #{status.exitstatus} before printing anything under RLIMIT_NPROC=#{threshold + 40}"
+    end
+
     check(status.success?, "exhaustion script failed: #{output.lines.last(3).join.strip}")
     result = JSON.parse(output.lines.last)
     note = if result["failed_at"] == "stop"

@@ -16,6 +16,8 @@ module RocotoActor
     # { limit:, in_use:, margin: } when the limit is finite and measurable,
     # nil otherwise.
     def snapshot(margin)
+      return nil if Process.uid.zero? # root is exempt from RLIMIT_NPROC, and /proc would count kernel threads
+
       limit = soft_limit
       in_use = limit && tasks_in_use
       return nil unless in_use
