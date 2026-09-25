@@ -2,47 +2,17 @@
 
 module RocotoActor
   # Internal ordered delivery of application lifecycle events and watcher
-  # notifications. Actor state is owned by ActorBroker; this class owns only
-  # watcher IDs, the delivery queue, and its event thread.
+  # notifications on one thread. Actor state, including who watches whom, is
+  # owned by ActorBroker; this class owns only the queue and its thread.
   class EventDispatcher
     def initialize(error_handler:, &deliver)
       @error_handler = error_handler
       @deliver = deliver
-      @watchers = {}
       @events = Queue.new
       @thread = nil
     end
 
-    def watch(watched_id, watcher_id)
-      (@watchers[watched_id] ||= {})[watcher_id] = true
-    end
-
-    def remove_watch(watched_id, watcher_id) # rubocop:disable Naming/PredicateMethod
-      !@watchers[watched_id]&.delete(watcher_id).nil?
-    end
-
-    def watcher_ids(node_id)
-      @watchers.fetch(node_id, {}).keys
-    end
-
-    def emit(node_id, event, detail, terminal:, watcher_ids: nil, notify_application: true)
-      ids = watcher_ids || self.watcher_ids(node_id)
-      @watchers.delete(node_id) if terminal
-      enqueue(node_id, event, detail, ids, notify_application)
-    end
-
-    def purge(node_id)
-      @watchers.each_value { |watchers| watchers.delete(node_id) }
-    end
-
-    def stop
-      @events.close
-      @thread
-    end
-
-    private
-
-    def enqueue(node_id, event, detail, watcher_ids, notify_application)
+    def emit(node_id, event, detail, watcher_ids, notify_application: true)
       return if @events.closed?
 
       @events << [node_id, event, detail, watcher_ids, notify_application]
@@ -60,6 +30,13 @@ module RocotoActor
       end
       @thread.name = "rocoto-actor-broker-events" if @thread.respond_to?(:name=)
     end
+
+    def stop
+      @events.close
+      @thread
+    end
+
+    private
 
     def report_error(error, context)
       @error_handler.call(error, context)
