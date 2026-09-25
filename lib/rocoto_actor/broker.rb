@@ -449,6 +449,7 @@ module RocotoActor
     # the caller must settle the boot future exactly once.
     def launch_node(actor_class, arguments, parent_id:, name:, options:)
       name = validate_name(name)
+      @mutex.synchronize { check_placement(parent_id, name) } # cheap rejection before a /proc scan and a process
       id = SecureRandom.hex(16)
       reference, boot = launch_process(actor_class, arguments, id, options.launch)
       spec = { actor_class: actor_class, arguments: arguments, options: options.launch,
@@ -488,8 +489,11 @@ module RocotoActor
 
         first_boot = node.first_boot?
         if error
-          node.boot_failed
-          [first_boot, node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, node.reference]
+          # Detaching the reference first means the reaper, seeing an exit from
+          # a reference the node no longer holds, leaves this failure to us.
+          dead = node.boot_failed
+          node.record_failure(error) if error.is_a?(RemoteError) && !first_boot
+          [first_boot, node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, dead]
         else
           if node.boot_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC)) && !first_boot
             emit(node, :restarted,
@@ -503,7 +507,7 @@ module RocotoActor
       actor_failed(node) if exited
       return nil unless error
 
-      reference&.stop(force: true, timeout: 0)
+      reference&.kill # without waiting: this may be the scheduler thread
       if first_boot
         unregister(node)
         stop_later(children)

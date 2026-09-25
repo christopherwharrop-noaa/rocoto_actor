@@ -1,7 +1,26 @@
 # frozen_string_literal: true
 
 require_relative "support/broker_test_case"
+require "tmpdir"
+require_relative "support/supervisor_actor"
 class BrokerRestartTest < BrokerTestCase
+  def test_a_relaunch_whose_initialize_fails_consumes_exactly_one_restart_attempt
+    Dir.mktmpdir do |dir|
+      flag = File.join(dir, "refuse-boot")
+      actor = @broker.spawn(FlakyBootActor, flag, name: "flaky", restart: :on_failure, max_restarts: 3,
+                                                  restart_backoff: 0.01)
+      File.write(flag, "")
+
+      assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+      wait_until(timeout: 10) { actor.state == :failed }
+
+      # Three attempts, each installing a reference: generations 2, 3, 4. A
+      # double-counted failure would exhaust the budget after fewer attempts.
+      assert_equal 4, actor.generation
+      assert_match(/boot refused/, actor.last_failure&.remote_message.to_s)
+    end
+  end
+
   def test_crashed_actor_restarts_with_the_same_handle_and_a_new_generation
     actor = @broker.spawn(ExampleActor, "phoenix", name: "phoenix", restart: :on_failure, restart_backoff: 0.01)
     assert_equal 1, actor.generation

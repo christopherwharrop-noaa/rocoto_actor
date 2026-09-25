@@ -17,19 +17,9 @@ module RocotoActor
     # process. context: is delivered to the actor as RocotoActor.context.
     def launch(actor_class, *arguments, source: nil, mailbox_size: DEFAULT_MAILBOX_SIZE,
                mailbox_bytes: DEFAULT_MAILBOX_BYTES, context: nil)
-      actor_name = actor_class.is_a?(String) ? actor_class : actor_class.name
-      raise ArgumentError, "actor class must have a name" if actor_name.nil? || actor_name.empty?
-
-      source ||= Object.const_source_location(actor_name)&.first
-      raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source
-
-      # Reject bad options and unserializable arguments before paying for a process.
-      raise ArgumentError, "mailbox_size must be positive" unless mailbox_size.is_a?(Integer) && mailbox_size.positive?
-      unless mailbox_bytes.is_a?(Integer) && mailbox_bytes.positive?
-        raise ArgumentError,
-              "mailbox_bytes must be positive"
-      end
-
+      actor_name, source = resolve(actor_class, source)
+      # Reject unserializable arguments before paying for a process; the
+      # mailbox options were validated by SpawnOptions.
       Transport.dump(arguments: arguments, context: context)
 
       parent_socket, child_socket = UNIXSocket.pair
@@ -38,7 +28,7 @@ module RocotoActor
         "ROCOTO_ACTOR_FD" => CHILD_SOCKET_FD.to_s,
         "ROCOTO_ACTOR_PARENT_PID" => parent_pid.to_s,
         "ROCOTO_ACTOR_CLASS" => actor_name,
-        "ROCOTO_ACTOR_SOURCE" => File.expand_path(source)
+        "ROCOTO_ACTOR_SOURCE" => source
       }
       pid = Process.spawn(
         environment,
@@ -63,6 +53,18 @@ module RocotoActor
         terminate_failed_spawn(pid)
       end
       raise
+    end
+
+    # The actor's class name and the absolute path of the file that defines it.
+    # A class name string requires source: unless the constant is defined here.
+    def resolve(actor_class, source)
+      actor_name = actor_class.is_a?(String) ? actor_class : actor_class.name
+      raise ArgumentError, "actor class must have a name" if actor_name.nil? || actor_name.empty?
+
+      source ||= Object.const_source_location(actor_name)&.first
+      raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source
+
+      [actor_name, File.expand_path(source)]
     end
 
     # Maps a boot future's failure to the error the spawner sees.

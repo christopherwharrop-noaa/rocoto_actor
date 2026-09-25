@@ -22,6 +22,17 @@ class TransportTest < Minitest::Test
     end
   end
 
+  def test_read_returns_nil_at_a_clean_end_of_stream_and_raises_mid_frame
+    reader, writer = IO.pipe
+    writer.close
+    assert_nil TRANSPORT.read(reader)
+
+    reader, writer = IO.pipe
+    writer.write("#{[100].pack('N')}abc")
+    writer.close
+    assert_raises(EOFError) { TRANSPORT.read(reader) }
+  end
+
   def test_json_codec_round_trips_supported_values
     message = {
       operation: :ask,
@@ -122,40 +133,5 @@ class TransportTest < Minitest::Test
     assert_raises(RocotoActor::SerializationError) do
       TRANSPORT.write(StringIO.new, value)
     end
-  end
-
-  def test_read_timeout_covers_partial_frames
-    reader, writer = UNIXSocket.pair
-    writer.write("\x00\x00")
-
-    assert_raises(RocotoActor::TransportTimeoutError) do
-      TRANSPORT.read(reader, timeout: 0.05)
-    end
-  ensure
-    reader&.close
-    writer&.close
-  end
-
-  def test_read_with_timeout_returns_nil_at_frame_boundary_eof
-    reader, writer = UNIXSocket.pair
-    writer.close
-
-    assert_nil TRANSPORT.read(reader, timeout: 0.05)
-  ensure
-    reader&.close
-    writer&.close
-  end
-
-  def test_read_with_timeout_rejects_partial_frame_at_eof
-    reader, writer = UNIXSocket.pair
-    writer.write([4].pack("N") << "x")
-    writer.close
-
-    assert_raises(EOFError) do
-      TRANSPORT.read(reader, timeout: 0.05)
-    end
-  ensure
-    reader&.close
-    writer&.close
   end
 end

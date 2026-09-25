@@ -4,12 +4,26 @@ module RocotoActor
   # How an actor's worker process ended, as reported by its watchdog: exited
   # with exitstatus, or killed by termsig.
   ExitStatus = Struct.new(:exitstatus, :termsig) do
+    # Fields come off the wire from the watchdog; anything but an Integer is
+    # treated as unknown rather than trusted.
+    def self.from_reply(reply)
+      new(reply[:exitstatus].is_a?(Integer) ? reply[:exitstatus] : nil,
+          reply[:termsig].is_a?(Integer) ? reply[:termsig] : nil)
+    end
+
     def signaled?
       !termsig.nil?
     end
 
     def to_s
-      signaled? ? "killed by signal #{termsig} (#{Signal.signame(termsig)})" : "exited with status #{exitstatus}"
+      return "exited with status #{exitstatus.nil? ? 'unknown' : exitstatus}" unless signaled?
+
+      name = begin
+        Signal.signame(termsig)
+      rescue ArgumentError
+        nil
+      end
+      "killed by signal #{termsig}#{" (#{name})" if name}"
     end
   end
 
@@ -41,8 +55,14 @@ module RocotoActor
     attr_reader :exit_status
 
     def initialize(socket, pid, mailbox_size:, mailbox_bytes:)
-      raise ArgumentError, "mailbox_size must be positive" unless mailbox_size.positive?
-      raise ArgumentError, "mailbox_bytes must be positive" unless mailbox_bytes.positive?
+      unless mailbox_size.is_a?(Integer) && mailbox_size.positive?
+        raise ArgumentError,
+              "mailbox_size must be a positive integer"
+      end
+      unless mailbox_bytes.is_a?(Integer) && mailbox_bytes.positive?
+        raise ArgumentError,
+              "mailbox_bytes must be a positive integer"
+      end
 
       @socket = socket
       @pid = pid
@@ -173,6 +193,11 @@ module RocotoActor
       end
     end
 
+    # Kills the process group without waiting for it to be gone. Idempotent.
+    def kill
+      force_stop
+    end
+
     private
 
     # Queues one request and returns [id, future], or [nil, nil] when no reply
@@ -228,11 +253,6 @@ module RocotoActor
       @socket.close unless @socket.closed?
     rescue IOError
       nil
-    end
-
-    # Kills the process group without waiting for it to be gone. Idempotent.
-    def kill
-      force_stop
     end
 
     # Kills the process group now. Idempotent; always ensures a reaper exists.
@@ -311,7 +331,7 @@ module RocotoActor
           @exit_error = RemoteError.new(reply[:error_class], reply[:message], reply[:backtrace])
           next
         when :actor_exit
-          @exit_status = ExitStatus.new(reply[:exitstatus], reply[:termsig])
+          @exit_status = ExitStatus.from_reply(reply)
           next
         end
 

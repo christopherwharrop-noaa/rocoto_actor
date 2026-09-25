@@ -86,16 +86,35 @@ class BrokerLimitsTest < BrokerTestCase
     broker&.stop(timeout: 2, force: true)
   end
 
-  def test_children_are_stopped_inline_when_no_lifecycle_thread_is_available
+  def test_children_are_killed_when_no_lifecycle_thread_is_available
     parent = @broker.spawn(ExampleActor, "parent", name: "parent")
     child = @broker.spawn(ExampleActor, "child", name: "child", parent: parent)
+    child_pid = child.ask(:pid).value(timeout: 2)
 
     @broker.instance_variable_get(:@lifecycle_executor).stub(:enqueue_job, NO_THREAD) do
       assert_raises(RocotoActor::ActorStoppedError) { parent.ask(:crash).value(timeout: 2) }
       wait_until { parent.state == :failed && child.state == :stopped }
+      wait_until(timeout: 5) { process_gone?(child_pid) }
     end
 
     refute child.alive?
+  end
+
+  def test_broker_stop_from_an_error_handler_on_a_lifecycle_thread_does_not_deadlock
+    result = Queue.new
+    broker = RocotoActor::ActorBroker.new(error_handler: lambda { |_error, context|
+      result << broker.stop(timeout: 2, force: true) if context.start_with?("relaunch of")
+    })
+    actor = broker.spawn(ExampleActor, "x", name: "x", restart: :on_failure, restart_backoff: 0.01)
+
+    PROCESS_BUDGET.stub(:snapshot, NEAR_LIMIT) do # the relaunch is refused on a lifecycle thread and reported there
+      assert_raises(RocotoActor::ActorStoppedError) { actor.ask(:crash).value(timeout: 2) }
+      assert_equal true, result.pop(timeout: 5)
+    end
+
+    assert_empty broker.roots
+  ensure
+    broker&.stop(timeout: 2, force: true)
   end
 
   def test_a_boot_or_call_that_cannot_be_timed_fails_instead_of_waiting
