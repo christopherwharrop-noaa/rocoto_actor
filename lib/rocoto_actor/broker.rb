@@ -53,7 +53,6 @@ module RocotoActor
       @error_handler = error_handler
       @on_event = on_event
       @waiting = {} # node id => id of the node it is blocked on (a call or a child's boot)
-      @node_ids_by_reference = {}.compare_by_identity
       @timers = {} # id => TimerRecord; an actor's timers die with its incarnation
       @mutex = Mutex.new
       @capacity_condition = ConditionVariable.new
@@ -268,7 +267,7 @@ module RocotoActor
 
     def unwatch(source, request, release_response)
       removed = @mutex.synchronize do
-        watcher = @nodes[@node_ids_by_reference[source]]
+        watcher = node_for(source)
         watcher && @event_dispatcher.remove_watch(request[:handle_id], watcher.id)
       end
       respond(source, request[:request_id], removed, release_response)
@@ -343,7 +342,7 @@ module RocotoActor
 
     def cancel_timer(source, request, release_response)
       cancelled = @mutex.synchronize do
-        node = @nodes[@node_ids_by_reference[source]]
+        node = node_for(source)
         record = @timers[request[:timer_id]]
         next false unless node && record && record.node_id == node.id
 
@@ -392,8 +391,15 @@ module RocotoActor
 
     # Caller holds @mutex. The handle of the actor behind a source reference.
     def sender_handle(source)
-      id = @node_ids_by_reference[source]
+      id = node_for(source)&.id
       id && ActorHandle.new(id, broker: self)
+    end
+
+    # Caller holds @mutex. The node a source reference currently belongs to, or
+    # nil when the reference is not (or no longer) a node's live connection.
+    def node_for(source)
+      node = source.actor_id && @nodes[source.actor_id]
+      node if node&.reference.equal?(source)
     end
 
     # Never blocks on the target actor; the response is sent when the target
@@ -408,7 +414,7 @@ module RocotoActor
       reference, sender, rejection = acquire_route(source, request[:handle_id])
       return respond_error(source, request_id, rejection, release_response) if rejection
 
-      source_id = @mutex.synchronize { @node_ids_by_reference[source] }
+      source_id = @mutex.synchronize { node_for(source)&.id }
       release_route = release_once { release_route_slot(source_id) }
       begin
         future = reference.ask(request[:message], sender)
@@ -601,7 +607,7 @@ module RocotoActor
 
     # Caller holds @mutex.
     def source_node(source)
-      node = @nodes[@node_ids_by_reference[source]] or raise Error, "unknown source actor"
+      node = node_for(source) or raise Error, "unknown source actor"
       raise ActorStoppedError, "actor #{node.path} is #{node.state}" unless node.active?
 
       node
@@ -657,7 +663,7 @@ module RocotoActor
           spec: spec, policy: policy
         )
         @nodes[id] = node
-        @node_ids_by_reference[reference] = id
+        reference.actor_id = id
         parent&.children&.push(id)
         node
       end
@@ -675,8 +681,7 @@ module RocotoActor
       purge_timers(node)
       purge_watches(node)
       reason = exit_reason(node.reference)
-      reference = node.retire(state)
-      @node_ids_by_reference.delete(reference) if reference
+      node.retire(state)
       emit(node, state, reason)
     end
 
@@ -811,10 +816,9 @@ module RocotoActor
       installed = @mutex.synchronize do
         next false unless node.state == :restarting
 
-        @node_ids_by_reference.delete(node.reference)
         purge_watches(node)
         node.install_restarted_reference(reference)
-        @node_ids_by_reference[reference] = node.id
+        reference.actor_id = node.id
         true
       end
       unless installed
@@ -890,7 +894,7 @@ module RocotoActor
           next [nil, nil, BrokerBusyError.new("actor broker has #{@max_routes} routes in flight")]
         end
 
-        source_id = @node_ids_by_reference[source]
+        source_id = node_for(source)&.id
         cycle = source_id && wait_cycle(source_id, node.id)
         next [nil, nil, DeadlockError.new("call would deadlock: #{cycle.join(' -> ')}")] if cycle
 

@@ -92,11 +92,9 @@ module RocotoActor
     def retire(state)
       @state = state
       record_reference(@reference)
-      reference = @reference
       @reference = nil
       @spec = nil
       @restarts = 0
-      reference
     end
 
     private

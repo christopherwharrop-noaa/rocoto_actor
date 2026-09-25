@@ -38,7 +38,8 @@ class ActorNodeTest < Minitest::Test
     @reference.exit_error = error
     @reference.exit_status = status
 
-    assert_same @reference, @node.retire(:failed)
+    @node.retire(:failed)
+
     assert_equal :failed, @node.state
     assert_nil @node.reference
     assert_nil @node.spec

@@ -12,8 +12,10 @@ require_relative "watch_actor"
 require "tmpdir"
 
 class BrokerTestCase < Minitest::Test
+  # Stands in for a Reference that is not registered with the broker.
   class FakeSource
     attr_reader :responses
+    attr_accessor :actor_id
 
     def initialize
       @responses = []
