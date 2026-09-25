@@ -290,6 +290,13 @@ class RocotoActorTest < Minitest::Test
     assert_operator elapsed, :<, 1
   end
 
+  def test_exit_status_fields_from_the_wire_are_not_trusted
+    status = RocotoActor::ExitStatus.from_reply(exitstatus: nil, termsig: "x")
+    assert_equal "exited with status unknown", status.to_s
+    assert_equal "killed by signal 9 (KILL)", RocotoActor::ExitStatus.from_reply(exitstatus: nil, termsig: 9).to_s
+    assert_equal "killed by signal 999", RocotoActor::ExitStatus.from_reply(exitstatus: nil, termsig: 999).to_s
+  end
+
   def test_stop_observes_the_exit_without_a_reaper_thread
     reaper = @actor.instance_variable_get(:@reaper)
     reaper.kill

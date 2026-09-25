@@ -59,8 +59,20 @@ module RocotoActor
       @generation == 1
     end
 
+    # Ends a failed boot: the incarnation's reference is detached (its exit
+    # is already accounted for by the caller) and returned to be killed.
     def boot_failed
       @booting = false
+      record_reference(@reference)
+      reference = @reference
+      @reference = nil
+      reference
+    end
+
+    # A relaunch whose initialize failed reports the error as a boot reply, not
+    # as an exit frame; keep it as the failure so last_failure explains it.
+    def record_failure(error)
+      @failure = error
     end
 
     def record_boot_exit(reference)

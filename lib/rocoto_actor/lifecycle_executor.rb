@@ -66,7 +66,7 @@ module RocotoActor
         @queue = []
         [@workers.dup, queued.grep(Request)]
       end
-      workers.each(&:join)
+      workers.each { |worker| worker.join unless worker == Thread.current } # stop may run on a worker via error_handler
       requests
     end
 

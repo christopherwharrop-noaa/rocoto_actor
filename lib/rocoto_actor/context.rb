@@ -41,18 +41,13 @@ module RocotoActor
     # Asks the broker to spawn a logical child of this actor and returns its
     # handle. The child process is owned by the application like any other.
     def spawn(actor_class, *arguments, name: nil, source: nil, **options)
-      actor_name = actor_class.is_a?(String) ? actor_class : actor_class.name
-      raise ArgumentError, "actor class must have a name" if actor_name.nil? || actor_name.empty?
-
+      actor_name, source = Launcher.resolve(actor_class, source)
       SpawnOptions.parse(options) # fail here, with the same message the broker would give
-
-      source ||= Object.const_source_location(actor_name)&.first
-      raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source
 
       request = Protocol.request(
         :broker_spawn,
         actor_class: actor_name,
-        source: File.expand_path(source),
+        source: source,
         arguments: arguments,
         name: name,
         options: options

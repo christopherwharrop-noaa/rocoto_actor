@@ -78,7 +78,7 @@ Suite: `110 runs, 412 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10
 | S1 socket | pass | `socketpair`, no filesystem path |
 | S4 50,000 decoded symbols | pass | mortal dynamic symbols 111 → 50,111 → 111 after GC |
 
-Cases covered by the normal suite rather than the matrix: startup timeout with a boot that ignores `TERM`; socket back-pressure not blocking `ask` or `stop`; descendants ignoring `TERM` removed by group `KILL`; worker exit with an inherited socket; application death with background children; codec rejection of unsupported values, cycles, invalid UTF-8, oversized frames, and non-finite floats; read timeouts across partial frames.
+Cases covered by the normal suite rather than the matrix: startup timeout with a boot that ignores `TERM`; socket back-pressure not blocking `ask` or `stop`; descendants ignoring `TERM` removed by group `KILL`; worker exit with an inherited socket; application death with background children; codec rejection of unsupported values, cycles, invalid UTF-8, oversized frames, and non-finite floats; a clean end of stream versus a stream closed mid-frame (there is deliberately no read timeout: a partial frame abandoned on a deadline would desynchronize the stream, so waiting is bounded elsewhere).
 
 Not reproduced here, with reasoning:
 

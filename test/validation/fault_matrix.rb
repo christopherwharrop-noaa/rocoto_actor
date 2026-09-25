@@ -485,7 +485,7 @@ class FaultMatrix
              end
       frame = [random.rand(0..1).zero? ? body.bytesize : random.rand(0..((2**32) - 1))].pack("N") + body
       begin
-        TRANSPORT.read(StringIO.new(frame), timeout: 0.5)
+        TRANSPORT.read(StringIO.new(frame))
         classes[:decoded] += 1
       rescue RocotoActor::Error, EOFError => error
         classes[error.class.name.split("::").last.to_sym] += 1

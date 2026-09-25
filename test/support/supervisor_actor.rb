@@ -71,6 +71,19 @@ class DiesAfterBootActor
   end
 end
 
+# Boots normally until a flag file appears, then fails every initialize.
+class FlakyBootActor
+  def initialize(flag_path)
+    raise "boot refused while #{flag_path} exists" if File.exist?(flag_path)
+  end
+
+  def receive(message)
+    exit! 3 if message == :crash
+
+    :ok
+  end
+end
+
 # Spawns one child successfully, then fails its own initialize.
 class FailingInitSpawnActor
   def initialize
