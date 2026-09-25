@@ -29,6 +29,9 @@ module RocotoActor
         end
       end
       @thread.name = "rocoto-actor-broker-events" if @thread.respond_to?(:name=)
+    rescue ThreadError => error
+      # The events stay queued; the next emit tries to start the thread again.
+      report_error(error, "starting the event thread")
     end
 
     def stop

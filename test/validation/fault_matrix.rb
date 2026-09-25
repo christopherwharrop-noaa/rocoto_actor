@@ -572,16 +572,25 @@ class FaultMatrix
 
     script = <<~RUBY
       require "rocoto_actor"; require "#{File.expand_path('../support/example_actor', __dir__)}"
-      broker = RocotoActor::ActorBroker.new(error_handler: ->(*) {})
+      reported = []
+      broker = RocotoActor::ActorBroker.new(error_handler: ->(e, c) { reported << "\#{c}: \#{e.class}" }, process_margin: nil)
       actors = []
+      failed_at = nil
       error = nil
       begin
         60.times { |i| actors << broker.spawn(ExampleActor, "p", name: "p\#{i}", start_timeout: 10) }
       rescue StandardError => e
+        failed_at = "spawn"
         error = e
       end
-      broker.stop(timeout: 10, force: true)
-      puts JSON.generate(spawned: actors.size, error: error&.class&.name, message: error&.message.to_s[0, 80])
+      begin
+        broker.stop(timeout: 10, force: true)
+      rescue StandardError => e
+        failed_at ||= "stop"
+        error ||= e
+      end
+      puts JSON.generate(spawned: actors.size, failed_at: failed_at, error: error&.class&.name,
+                         message: error&.message.to_s[0, 80], reported: reported.uniq.first(3))
     RUBY
     output, status = limited("--nproc=#{threshold + 40}:#{threshold + 40}", script, allow_hang: true)
     if status.exitstatus == 137
@@ -591,11 +600,14 @@ class FaultMatrix
     end
     check(status.success?, "exhaustion script failed: #{output.lines.last(3).join.strip}")
     result = JSON.parse(output.lines.last)
-    note = if result["error"]
-             "spawn failed cleanly"
+    note = if result["failed_at"] == "stop"
+             "stop raised; thread exhaustion must never escape from stop"
+           elsif result["error"]
+             "#{result['failed_at']} failed cleanly"
            else
              "limit not enforced for this user (root bypasses RLIMIT_NPROC); no failure to observe"
            end
+    check(result["failed_at"] != "stop", note)
     "#{result} #{note}"
   end
 

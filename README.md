@@ -172,7 +172,7 @@ class SupervisorActor
 end
 ```
 
-The event arrives as a tell from the broker (`context.sender` is `nil`). A watch lasts until the watched actor stops or fails for good, or until the watching incarnation ends; a restarted watcher must watch again, just as it respawns its children. Watching an actor that has already stopped or failed delivers that event immediately. `context.unwatch(handle)` ends a watch early. The application sees the same events through `RocotoActor::ActorBroker.new(on_event: ->(event, handle, detail) { ... })`, with `detail[:reason]` and `detail[:generation]`. It is called on the broker's event thread, in order; a slow handler delays later events but nothing else. Watching an actor that has already ended replays its final event to that watcher only, not to `on_event`.
+The event arrives as a tell from the broker (`context.sender` is `nil`). A watch lasts until the watched actor stops or fails for good, or until the watching incarnation ends; a restarted watcher must watch again, just as it respawns its children. Watching an actor that has already stopped or failed delivers that event immediately. `context.unwatch(handle)` ends a watch early. The application sees the same events through `RocotoActor::ActorBroker.new(on_event: ->(event, handle, detail) { ... })`, with `detail[:reason]` and `detail[:generation]`. It is called on the broker's event thread, in order; a slow handler delays later events but nothing else. Watching an actor that has already ended replays its final event to that watcher only, not to `on_event`. `broker.stop` delivers no events for the actors it stops: the application asked for the shutdown, and the watchers are being stopped with them.
 
 ### Shutting down cleanly
 
@@ -243,6 +243,14 @@ The broker's own threads never die silently: a failure while running a route exp
 Routing is bounded and does not create a thread per request. `RocotoActor::ActorBroker.new(max_routes: 1_000, max_routes_per_actor: 100)` limits requests awaiting a target across the broker and unwritten responses owed to one actor. A request beyond `max_routes` fails with `RocotoActor::BrokerBusyError`; an actor at `max_routes_per_actor` is not read from until its responses drain, without affecting other actors.
 
 If the application exits, the watchdog detects it within 100 milliseconds and terminates the actor group independently of the worker's state. A process blocked in uninterruptible kernel sleep remains until the kernel operation returns, but the application does not wait for it.
+
+## Deployment
+
+Each actor costs two operating-system processes (the watchdog and the worker) and three threads in the application (socket reader, socket writer, and reaper), about seven kernel tasks in all; the broker adds a few shared threads. An application with three actors is therefore seven processes and roughly 26 tasks. Every task counts against the user's process limit (`ulimit -u`, `RLIMIT_NPROC`), which is measured across everything the user runs on the machine, and reaching it is not graceful: Ruby can block in a futex and ignore `TERM`. The broker therefore checks before every launch, including actor-initiated spawns and restarts, that one more actor plus a margin still fits, and raises `RocotoActor::ResourceLimitError` (actors see it as a `RemoteError`) instead of starting a process that may wedge the system. `RocotoActor::ActorBroker.new(process_margin: 32)` sets the margin; `nil` disables the check. The count comes from `/proc`, so nothing is forked to make it; where `/proc` is absent or the limit is unlimited no check is made, and inside a container the count covers only what the container can see. `broker.describe[:process_limit]` reports the limit, the tasks in use, and the margin.
+
+If a broker thread cannot be created at all, the failure is reported to `error_handler` and the affected request fails with `ResourceLimitError`; nothing propagates into other threads or into `stop`.
+
+Accepted limitations, all recorded with their evidence in `docs/linux-validation.md`: a process in uninterruptible `D` state cannot be killed until the kernel releases it (`stop` returns `false` after its grace); a subprocess that creates its own session or process group escapes containment; and process-limit exhaustion is avoided rather than survived.
 
 ## Security boundary
 

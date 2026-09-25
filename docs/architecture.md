@@ -49,6 +49,7 @@ Owns the logical actor registry and all cross-actor policy:
 - restart policy
 - watches and application lifecycle events
 - actor-owned timers
+- the process-limit preflight before every launch (`ProcessBudget`)
 
 The broker has one mutex protecting this state. It never calls a `Reference`
 method that takes the reference mutex while holding the broker mutex.
@@ -127,7 +128,11 @@ outside its mutex.
   notifications.
 
 These remain separate because service deadlines must not be delayed by
-blocking lifecycle operations or slow event consumers.
+blocking lifecycle operations or slow event consumers. A thread that cannot be
+created (`RLIMIT_NPROC`) is reported through `error_handler`; a lifecycle
+request then fails with `ResourceLimitError`, and scheduler or event work stays
+queued until a later attempt starts the thread. `broker.stop` closes the event
+queue before retiring actors, so a shutdown emits no events.
 
 ## Lock and callback rules
 
@@ -160,6 +165,7 @@ interleavings that reviews must preserve.
 | --- | --- |
 | Public API | `broker.rb`, `handle.rb`, `context.rb`, `timer.rb`, `future.rb` |
 | Spawn option parsing (shared by application and worker) | `spawn_options.rb` |
+| Process-limit preflight | `process_budget.rb` |
 | Connection and process lifecycle | `reference.rb`, `launcher.rb`, `runner.rb` |
 | Worker-to-broker protocol | `protocol.rb`, `decode_bindings.rb`, `broker_client.rb`, `transport.rb` |
 | Errors | `errors.rb` |

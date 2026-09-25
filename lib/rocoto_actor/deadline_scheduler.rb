@@ -49,12 +49,17 @@ module RocotoActor
 
     private
 
+    # Caller holds @mutex. Queued work waits for the thread; if it cannot be
+    # created now (RLIMIT_NPROC), the failure is reported and the next enqueue
+    # tries again.
     def start_thread_locked
       return if @thread&.alive?
 
       @thread = Thread.new { run }
       @thread.report_on_exception = false
       @thread.name = "rocoto-actor-broker" if @thread.respond_to?(:name=)
+    rescue ThreadError => error
+      @error_handler.call(error, "starting the scheduler thread")
     end
 
     def run
