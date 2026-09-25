@@ -129,10 +129,18 @@ outside its mutex.
 
 These remain separate because service deadlines must not be delayed by
 blocking lifecycle operations or slow event consumers. A thread that cannot be
-created (`RLIMIT_NPROC`) is reported through `error_handler`; a lifecycle
-request then fails with `ResourceLimitError`, and scheduler or event work stays
-queued until a later attempt starts the thread. `broker.stop` closes the event
-queue before retiring actors, so a shutdown emits no events.
+created (`RLIMIT_NPROC`) is reported through `error_handler` and the work is
+failed rather than left waiting: a lifecycle request fails with
+`ResourceLimitError`; a boot or brokered call that cannot be given a deadline
+is rejected with `ResourceLimitError`; a timer that cannot be armed is dropped;
+a relaunch that cannot be queued counts as a failure; and children of a failed
+actor are killed without waiting (`kill_subtrees`) instead of being stopped on
+the pool. The scheduler reports "stopped" distinctly from "no thread", so work
+racing `broker.stop` fails with `ActorStoppedError`. Event work stays queued
+until a later emit starts the thread. A `Reference` with no reaper thread
+observes its process's exit by polling in `wait_for_exit`; `alive?` remains a
+pure query. `broker.stop` closes the event queue before retiring actors, so a
+shutdown emits no events.
 
 ## Lock and callback rules
 

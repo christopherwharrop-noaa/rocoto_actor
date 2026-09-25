@@ -14,13 +14,14 @@ module RocotoActor
       @thread = nil
     end
 
-    # Returns true when the expiration is armed on a live thread, false when the
-    # scheduler is stopped or its thread cannot be created: the caller must then
-    # fail the work itself rather than let it wait without a deadline.
+    # Returns true when the expiration is armed on a live thread, :stopped when
+    # the scheduler has been stopped, or false when its thread cannot be
+    # created. In the last two cases the caller must fail the work itself
+    # rather than let it wait without a deadline.
     def schedule_expiration(key, timeout, &block)
       deadline = monotonic_time + timeout
       @mutex.synchronize do
-        return false if @stopped
+        return :stopped if @stopped
 
         @expirations[key] = [deadline, timeout, block]
         armed = start_thread_locked
@@ -34,10 +35,11 @@ module RocotoActor
       @mutex.synchronize { @expirations.delete(key) }
     end
 
-    # Returns true when the task will run, false when it cannot be scheduled.
+    # Returns true when the task will run, :stopped when the scheduler has been
+    # stopped, or false when its thread cannot be created.
     def enqueue(delay: 0, &block)
       @mutex.synchronize do
-        return false if @stopped
+        return :stopped if @stopped
 
         entry = [monotonic_time + delay, block]
         @tasks << entry

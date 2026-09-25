@@ -290,6 +290,21 @@ class RocotoActorTest < Minitest::Test
     assert_operator elapsed, :<, 1
   end
 
+  def test_stop_observes_the_exit_without_a_reaper_thread
+    reaper = @actor.instance_variable_get(:@reaper)
+    reaper.kill
+    reaper.join
+    @actor.instance_variable_set(:@reaper, nil)
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    Thread.stub(:new, ->(*) { raise ThreadError, "simulated" }) do
+      assert @actor.stop(force: true, timeout: 2), "the exit must be observed by polling when no reaper can be started"
+    end
+
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at, :<, 1.5
+    refute @actor.alive?
+  end
+
   def test_failed_spawn_is_reaped_without_a_thread_to_reap_with
     pid = Process.spawn(RbConfig.ruby, "-e", "sleep 30", pgroup: true)
 

@@ -2,6 +2,8 @@
 
 require_relative "support/broker_test_case"
 require_relative "support/supervisor_actor"
+require_relative "support/ticker_actor"
+require_relative "support/process_actor"
 
 # Behaviour near the user's process limit (RLIMIT_NPROC): refusing to spawn
 # before the limit is hit, and never letting thread-creation failures escape
@@ -111,9 +113,30 @@ class BrokerLimitsTest < BrokerTestCase
   end
 
   def test_root_is_exempt_from_the_preflight
-    Process.stub(:uid, 0) do
-      assert_nil PROCESS_BUDGET.snapshot(32)
+    Process.stub(:uid, 0) { assert_nil PROCESS_BUDGET.snapshot(32) }
+    Process.stub(:euid, 0) { assert_nil PROCESS_BUDGET.snapshot(32) }
+  end
+
+  def test_work_racing_broker_stop_fails_as_stopped_not_as_a_resource_limit
+    reported = []
+    broker = RocotoActor::ActorBroker.new(error_handler: ->(error, context) { reported << [error.class, context] })
+    target = broker.spawn(ExampleActor, "target")
+    worker = broker.spawn(ForwardingActor, target)
+    ticker = broker.spawn(TickerActor, name: "ticker")
+    ticker.ask(op: :schedule, name: :beat, every: 0.02).value(timeout: 2)
+
+    broker.instance_variable_get(:@scheduler).stop # as broker.stop does, before the actors are retired
+    remote = assert_raises(RocotoActor::RemoteError) { worker.ask("hello").value(timeout: 2) }
+    assert_equal "RocotoActor::ActorStoppedError", remote.remote_class
+    timer = assert_raises(RocotoActor::RemoteError) do
+      ticker.ask(op: :schedule, name: :late, after: 1).value(timeout: 2)
     end
+    assert_equal "RocotoActor::ActorStoppedError", timer.remote_class
+    sleep 0.1
+
+    assert_empty reported, "a timer caught by shutdown is not a resource-limit failure"
+  ensure
+    broker&.stop(timeout: 2, force: true)
   end
 
   def test_lifecycle_executor_fails_a_request_it_cannot_start_a_thread_for

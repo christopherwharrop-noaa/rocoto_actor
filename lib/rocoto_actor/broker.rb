@@ -333,8 +333,11 @@ module RocotoActor
         node.timers[record.id] = record
         [node, record]
       end
-      unless enqueue_task(delay: after || every) { fire_timer(node, timer.id) }
+      armed = enqueue_task(delay: after || every) { fire_timer(node, timer.id) }
+      unless armed == true
         @mutex.synchronize { node.timers.delete(timer.id) }
+        raise ActorStoppedError, "actor broker is stopped" if armed == :stopped
+
         raise ResourceLimitError, "the broker cannot start a thread to run the timer"
       end
       respond(source, request[:request_id], Timer.new(timer.id), release_response)
@@ -376,9 +379,13 @@ module RocotoActor
         report_error(error, "scheduled tell to #{node.id}")
       end
       return unless record.every
-      return if enqueue_task(delay: record.every) { fire_timer(node, id) }
+
+      armed = enqueue_task(delay: record.every) { fire_timer(node, id) }
+      return if armed == true
 
       @mutex.synchronize { node.timers.delete(id) }
+      return if armed == :stopped # the broker is shutting down; nothing to report
+
       report_error(ResourceLimitError.new("timer #{id} of #{node.path} dropped: no thread to run it"), "timer")
     end
 
@@ -420,8 +427,9 @@ module RocotoActor
         return respond_error(source, request_id, error, release_response)
       end
 
-      unless schedule_expiration(future, timeout)
-        future.reject(ResourceLimitError.new("the broker cannot start a thread to time the call"))
+      case schedule_expiration(future, timeout)
+      when :stopped then future.reject(ActorStoppedError.new("actor broker is stopped"))
+      when false then future.reject(ResourceLimitError.new("the broker cannot start a thread to time the call"))
       end
       future.on_resolve do |result, error|
         cancel_expiration(future)
@@ -459,8 +467,9 @@ module RocotoActor
     # future resolves, on whichever thread resolves it. The block receives the
     # error to raise or send, or nil on success.
     def await_boot(node, boot, start_timeout)
-      unless schedule_expiration(boot, start_timeout)
-        boot.reject(ResourceLimitError.new("the broker cannot start a thread to time the boot"))
+      case schedule_expiration(boot, start_timeout)
+      when :stopped then boot.reject(ActorStoppedError.new("actor broker is stopped"))
+      when false then boot.reject(ResourceLimitError.new("the broker cannot start a thread to time the boot"))
       end
       boot.on_resolve do |_result, error|
         cancel_expiration(boot)
@@ -773,10 +782,11 @@ module RocotoActor
       armed = enqueue_task(delay: delay) do
         actor_failed(node) unless enqueue_lifecycle_job { relaunch(node) } # no thread for it: count as a failure
       end
-      return if armed
+      return if armed != false # armed, or the broker is stopping and its sweep will retire the node
 
-      # No thread to even wait on: the restart policy cannot proceed.
-      @mutex.synchronize { retire(node, :failed) unless node.terminal? }
+      # No thread to even wait on: the restart policy cannot proceed. A stop
+      # that raced in owns the node from here.
+      @mutex.synchronize { retire(node, :failed) if node.state == :restarting }
     end
 
     # Force-stops nodes on the lifecycle pool: stopping waits on processes, and
@@ -785,9 +795,22 @@ module RocotoActor
       return if nodes.empty?
       return if enqueue_lifecycle_job { stop_subtrees(nodes, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) }
 
-      # No lifecycle thread available: stop them here rather than leave live
-      # processes under nodes already marked :stopping.
-      stop_subtrees(nodes, timeout: 1, force: true)
+      kill_subtrees(nodes)
+    end
+
+    # No lifecycle thread available: kill the subtrees without waiting, so the
+    # calling thread (a reaper or the scheduler) is not blocked on process
+    # exits, and retire the nodes; their reapers observe the exits later.
+    def kill_subtrees(roots)
+      references = @mutex.synchronize do
+        roots.flat_map { |root| live_postorder(root) }.uniq.map do |node|
+          node.begin_stopping
+          reference = node.reference
+          retire(node, :stopped)
+          reference
+        end
+      end
+      references.compact.each(&:kill)
     end
 
     # Caller holds @mutex. Records a restart attempt and returns its backoff
