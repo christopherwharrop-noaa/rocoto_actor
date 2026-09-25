@@ -14,6 +14,11 @@ module RocotoActor
   end
 
   class Reference
+    # A connection moves forward only: open (accepts requests) -> draining (a
+    # graceful stop is in flight, nothing new accepted) -> terminating (no more
+    # writes; pending futures rejected) -> exited (the watchdog process was
+    # reaped) -> gone (the whole process group is confirmed absent).
+    PHASES = %i[open draining terminating exited gone].freeze
     DEFAULT_STOP_TIMEOUT = 5
     # After a deadline forces a KILL, stop waits this much longer to confirm the
     # group is gone, so false means "still present after KILL" (for example a
@@ -51,11 +56,7 @@ module RocotoActor
       @outbox_bytes = 0
       @writing_bytes = 0
       @outbox_condition = ConditionVariable.new
-      @writer_stopped = false
-      @stopped = false
-      @termination_started = false
-      @process_exited = false
-      @group_exited = false
+      @phase = :open
       @exit_condition = ConditionVariable.new
       @reaper = nil
       @reaper_mutex = Mutex.new
@@ -81,8 +82,8 @@ module RocotoActor
     # exited, or immediately if it already has.
     def on_exit(&block)
       exited = @pending_mutex.synchronize do
-        @exit_callbacks << block unless @process_exited
-        @process_exited
+        @exit_callbacks << block unless reached?(:exited)
+        reached?(:exited)
       end
       block.call if exited
     end
@@ -93,7 +94,7 @@ module RocotoActor
       response = Protocol.broker_response(request_id, result: result, error: error)
       payload = Transport.dump(response)
       queued = @pending_mutex.synchronize do
-        next false if @writer_stopped
+        next false if reached?(:terminating)
 
         @control_outbox << [payload, on_done]
         @outbox_condition.signal
@@ -131,9 +132,9 @@ module RocotoActor
       end
 
       shutdown = @pending_mutex.synchronize do
-        next if @stopped
+        next unless @phase == :open
 
-        @stopped = true
+        @phase = :draining
         @next_id += 1
         id = @next_id
         future = Future.new { remove_pending(id) }
@@ -160,10 +161,10 @@ module RocotoActor
 
     def alive?
       @pending_mutex.synchronize do
-        return false if @group_exited
+        return false if reached?(:gone)
 
-        if @process_exited && !Launcher.process_group_alive?(@pid)
-          @group_exited = true
+        if reached?(:exited) && !Launcher.process_group_alive?(@pid)
+          @phase = :gone
           return false
         end
         true
@@ -176,7 +177,7 @@ module RocotoActor
     # is expected. limit: false bypasses the mailbox bound for the boot message.
     def enqueue(fields, limit: true, reply: true)
       @pending_mutex.synchronize do
-        raise ActorStoppedError, "actor is stopped" if @stopped
+        raise ActorStoppedError, "actor is stopped" unless @phase == :open
 
         id = future = nil
         if reply
@@ -196,25 +197,45 @@ module RocotoActor
       end
     end
 
-    def force_stop
-      pending = @pending_mutex.synchronize do
-        return if @termination_started
+    # Caller holds @pending_mutex. True once the connection has reached the
+    # phase or a later one.
+    def reached?(phase)
+      PHASES.index(@phase) >= PHASES.index(phase)
+    end
 
-        @termination_started = true
-        @stopped = true
-        @writer_stopped = true
+    # Advances to `phase` (:terminating or :exited) unless already there or
+    # beyond: nothing more is written, waiters are woken, and the futures that
+    # can no longer be answered are returned for the caller to reject outside
+    # the lock. Returns nil when there was nothing to do.
+    def enter(phase)
+      @pending_mutex.synchronize do
+        return nil if reached?(phase)
+
+        @phase = phase
         @outbox.clear
         @outbox_bytes = 0
         @outbox_condition.broadcast
+        @exit_condition.broadcast if phase == :exited
         values = @pending.values
         @pending.clear
         values
       end
-      pending.each { |future| future.reject(ActorStoppedError.new("actor stopped")) }
+    end
+
+    def close_socket
       @socket.close unless @socket.closed?
-      Launcher.signal_process_group(@pid, "KILL")
+    rescue IOError
       nil
-    rescue Errno::ESRCH, IOError
+    end
+
+    # Kills the process group now. Idempotent; always ensures a reaper exists.
+    def force_stop
+      pending = enter(:terminating)
+      if pending
+        pending.each { |future| future.reject(ActorStoppedError.new("actor stopped")) }
+        close_socket
+        Launcher.signal_process_group(@pid, "KILL")
+      end
       nil
     ensure
       start_reaper
@@ -223,8 +244,10 @@ module RocotoActor
     def write_requests
       loop do
         payload, on_done, stop_writer = @pending_mutex.synchronize do
-          @outbox_condition.wait(@pending_mutex) while @outbox.empty? && @control_outbox.empty? && !@writer_stopped
-          if @writer_stopped
+          until reached?(:terminating) || !@outbox.empty? || !@control_outbox.empty?
+            @outbox_condition.wait(@pending_mutex)
+          end
+          if reached?(:terminating)
             [nil, nil, true]
           elsif !@control_outbox.empty?
             [*@control_outbox.shift, false]
@@ -321,28 +344,25 @@ module RocotoActor
       pending.each { |future| future.reject(error) }
     end
 
+    # The actor confirmed a graceful stop: nothing is left to write, so close
+    # and let the watchdog end the group on its own.
     def close_and_reap
-      @pending_mutex.synchronize do
-        @writer_stopped = true
-        @outbox_condition.broadcast
-      end
-      @socket.close unless @socket.closed?
-    rescue IOError
-      nil
+      enter(:terminating)&.each { |future| future.reject(ActorStoppedError.new("actor stopped")) }
+      close_socket
     ensure
       start_reaper
     end
 
     def wait_for_mailbox_space(deadline, payload_bytes)
       until mailbox_has_space?(payload_bytes)
-        raise ActorStoppedError, "actor is stopped" if @termination_started
+        raise ActorStoppedError, "actor is stopped" if reached?(:terminating)
 
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         raise AskTimeoutError if remaining <= 0
 
         @outbox_condition.wait(@pending_mutex, remaining)
       end
-      raise ActorStoppedError, "actor is stopped" if @termination_started
+      raise ActorStoppedError, "actor is stopped" if reached?(:terminating)
     end
 
     def mailbox_has_space?(payload_bytes)
@@ -364,35 +384,19 @@ module RocotoActor
       end
     end
 
+    # Runs once on the reaper thread after the watchdog process is reaped.
     def actor_exited
-      pending, callbacks = @pending_mutex.synchronize do
-        return if @process_exited
+      pending = enter(:exited) or return
 
-        @process_exited = true
-        @stopped = true
-        @termination_started = true
-        @writer_stopped = true
-        @outbox.clear
-        @outbox_bytes = 0
-        @outbox_condition.broadcast
-        @exit_condition.broadcast
-        values = @pending.values
-        @pending.clear
-        [values, @exit_callbacks]
-      end
       pending.each { |future| future.reject(ActorStoppedError.new("actor process exited")) }
       discard_control_outbox
       # Killing the group closes every remaining copy of the socket, so the
       # reader reaches EOF; let it consume the watchdog's exit report first.
       Launcher.signal_process_group(@pid, "KILL")
       join_reader
-      begin
-        @socket.close unless @socket.closed?
-      rescue IOError
-        nil
-      end
+      close_socket
       # The broker learns of the exit here; nothing above may prevent it.
-      callbacks.each(&:call)
+      @pending_mutex.synchronize { @exit_callbacks }.each(&:call)
     end
 
     def kill_deadline(deadline)
@@ -410,7 +414,7 @@ module RocotoActor
 
     def wait_for_exit(deadline)
       @pending_mutex.synchronize do
-        until @process_exited
+        until reached?(:exited)
           remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
           return false if remaining <= 0
 
@@ -422,7 +426,7 @@ module RocotoActor
 
         sleep 0.01
       end
-      @pending_mutex.synchronize { @group_exited = true }
+      @pending_mutex.synchronize { @phase = :gone }
       true
     end
   end
