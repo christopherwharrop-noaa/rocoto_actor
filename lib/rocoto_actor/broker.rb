@@ -11,10 +11,6 @@ module RocotoActor
     DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS = 100
     MAX_TIMERS_PER_ACTOR = 100
     MIN_TIMER_INTERVAL = 0.01
-    RESTART_POLICIES = %i[never on_failure].freeze
-    DEFAULT_MAX_RESTARTS = 3
-    DEFAULT_RESTART_WINDOW = 60
-    DEFAULT_RESTART_BACKOFF = 0.1
     DEFAULT_ERROR_HANDLER = lambda do |error, context|
       warn "rocoto_actor: #{context}: #{error.class}: #{error.message}"
     end
@@ -76,22 +72,15 @@ module RocotoActor
 
     # parent: is a handle owned by this broker; the new actor becomes its logical
     # child and is stopped whenever the parent stops or fails. name: must be
-    # unique among the parent's live children and forms the actor's path.
-    # restart: :never (default) leaves a crashed actor :failed. :on_failure
-    # relaunches it with the same handle, path, and name and a new generation,
-    # after restart_backoff seconds doubling per consecutive restart, at most
-    # max_restarts times within restart_window seconds; beyond that it fails.
-    def spawn(actor_class, *arguments, name: nil, parent: nil, start_timeout: START_TIMEOUT,
-              restart: :never, max_restarts: DEFAULT_MAX_RESTARTS, restart_window: DEFAULT_RESTART_WINDOW,
-              restart_backoff: DEFAULT_RESTART_BACKOFF, **options)
-      raise ArgumentError, "start_timeout must be positive" unless valid_timeout?(start_timeout)
-
-      policy = validate_policy(restart: restart, max_restarts: max_restarts, restart_window: restart_window,
-                               restart_backoff: restart_backoff)
-      node, boot = launch_node(actor_class, arguments, parent_id: parent&.id, name: name, options: options,
-                                                       start_timeout: start_timeout, policy: policy)
+    # unique among the parent's live children and forms the actor's path. The
+    # remaining options are those of SpawnOptions: start_timeout, source,
+    # mailbox_size, mailbox_bytes, and the restart policy (restart: :never by
+    # default, or :on_failure with max_restarts, restart_window, restart_backoff).
+    def spawn(actor_class, *arguments, name: nil, parent: nil, **options)
+      spawn_options = SpawnOptions.parse(options)
+      node, boot = launch_node(actor_class, arguments, parent_id: parent&.id, name: name, options: spawn_options)
       begin
-        boot.value(timeout: start_timeout)
+        boot.value(timeout: spawn_options.start_timeout)
       rescue StandardError => error
         raise settle_boot(node, error)
       end
@@ -438,31 +427,15 @@ module RocotoActor
       respond_error(source, request_id, error, release_response)
     end
 
-    def validate_policy(restart:, max_restarts:, restart_window:, restart_backoff:)
-      unless RESTART_POLICIES.include?(restart)
-        raise ArgumentError,
-              "restart must be one of #{RESTART_POLICIES.join(', ')}"
-      end
-      unless max_restarts.is_a?(Integer) && max_restarts.positive?
-        raise ArgumentError,
-              "max_restarts must be a positive integer"
-      end
-      raise ArgumentError, "restart_window must be positive" unless valid_timeout?(restart_window)
-      unless restart_backoff.is_a?(Numeric) && restart_backoff >= 0 && restart_backoff.to_f.finite?
-        raise ArgumentError, "restart_backoff must be a non-negative number"
-      end
-
-      { restart: restart, max_restarts: max_restarts, restart_window: restart_window, restart_backoff: restart_backoff }
-    end
-
     # Starts the process and registers it as :starting. Returns [node, boot];
     # the caller must settle the boot future exactly once.
-    def launch_node(actor_class, arguments, parent_id:, name:, options:, start_timeout:, policy:)
+    def launch_node(actor_class, arguments, parent_id:, name:, options:)
       name = validate_name(name)
       id = SecureRandom.hex(16)
-      reference, boot = Launcher.launch(actor_class, *arguments, context: { actor_id: id }, **options)
-      spec = { actor_class: actor_class, arguments: arguments, options: options, start_timeout: start_timeout }
-      node = register(id, reference, parent_id, name, spec, policy)
+      reference, boot = Launcher.launch(actor_class, *arguments, context: { actor_id: id }, **options.launch)
+      spec = { actor_class: actor_class, arguments: arguments, options: options.launch,
+               start_timeout: options.start_timeout }
+      node = register(id, reference, parent_id, name, spec, options.policy)
       reference.attach_broker(self)
       reference.on_exit { actor_exited(node, reference) }
       [node, boot]
@@ -557,27 +530,13 @@ module RocotoActor
       raise ArgumentError, "arguments must be an array" unless arguments.is_a?(Array)
       raise ArgumentError, "options must be a hash" unless options.is_a?(Hash)
 
-      unknown = options.keys - ActorContext::SPAWN_OPTIONS
-      raise ArgumentError, "unsupported spawn options: #{unknown.join(', ')}" unless unknown.empty?
+      # The worker parsed these too; the broker is the trust boundary and parses again.
+      spawn_options = SpawnOptions.parse(options.merge(source: path))
 
-      options = options.dup
-      start_timeout = options.delete(:start_timeout) || START_TIMEOUT
-      raise ArgumentError, "start_timeout must be positive" unless valid_timeout?(start_timeout)
-
-      policy = validate_policy(
-        restart: options.delete(:restart) || :never,
-        max_restarts: options.delete(:max_restarts) || DEFAULT_MAX_RESTARTS,
-        restart_window: options.delete(:restart_window) || DEFAULT_RESTART_WINDOW,
-        restart_backoff: options.key?(:restart_backoff) ? options.delete(:restart_backoff) : DEFAULT_RESTART_BACKOFF
-      )
-      raise ArgumentError, "spawn options must be numeric" unless options.values.all?(Numeric)
-
-      options[:source] = path
-
-      node, boot = launch_node(actor_class, arguments, parent_id: parent.id, name: request[:name], options: options,
-                                                       start_timeout: start_timeout, policy: policy)
+      node, boot = launch_node(actor_class, arguments, parent_id: parent.id, name: request[:name],
+                                                       options: spawn_options)
       @mutex.synchronize { @waiting[parent.id] = node.id } # the parent blocks in context.spawn until the boot settles
-      schedule_expiration(boot, start_timeout)
+      schedule_expiration(boot, spawn_options.start_timeout)
       boot.on_resolve do |_result, error|
         cancel_expiration(boot)
         @mutex.synchronize { @waiting.delete(parent.id) if @waiting[parent.id] == node.id }

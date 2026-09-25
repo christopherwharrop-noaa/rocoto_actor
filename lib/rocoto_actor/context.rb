@@ -4,9 +4,6 @@ module RocotoActor
   # Broker-facing capability available to an actor as RocotoActor.context. It
   # carries no socket, reference, or process object of any other actor.
   class ActorContext
-    SPAWN_OPTIONS = %i[start_timeout mailbox_size mailbox_bytes restart max_restarts restart_window
-                       restart_backoff].freeze
-
     # The actor's own handle, or nil when the actor was not spawned by a broker.
     attr_reader :handle
 
@@ -47,8 +44,7 @@ module RocotoActor
       actor_name = actor_class.is_a?(String) ? actor_class : actor_class.name
       raise ArgumentError, "actor class must have a name" if actor_name.nil? || actor_name.empty?
 
-      unknown = options.keys - SPAWN_OPTIONS
-      raise ArgumentError, "unsupported spawn options: #{unknown.join(', ')}" unless unknown.empty?
+      SpawnOptions.parse(options) # fail here, with the same message the broker would give
 
       source ||= Object.const_source_location(actor_name)&.first
       raise ArgumentError, "cannot locate source for #{actor_name}; pass source:" unless source

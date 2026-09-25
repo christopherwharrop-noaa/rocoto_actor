@@ -150,6 +150,7 @@ interleavings that reviews must preserve.
 | Area | Primary files |
 | --- | --- |
 | Public API | `broker.rb`, `handle.rb`, `context.rb`, `timer.rb`, `future.rb` |
+| Spawn option parsing (shared by application and worker) | `spawn_options.rb` |
 | Connection and process lifecycle | `reference.rb`, `launcher.rb`, `runner.rb` |
 | Worker-to-broker protocol | `protocol.rb`, `decode_bindings.rb`, `broker_client.rb`, `transport.rb` |
 | Errors | `errors.rb` |
