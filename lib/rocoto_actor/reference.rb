@@ -22,6 +22,11 @@ module RocotoActor
 
     attr_reader :pid
 
+    # The logical actor this connection belongs to, set once by the broker at
+    # registration. A reference outlived by its node (a dead incarnation) keeps
+    # the id; the broker checks identity against the node's current reference.
+    attr_accessor :actor_id
+
     # RemoteError describing an unhandled exception in a told message, reported
     # by the actor just before it exited; nil otherwise.
     attr_reader :exit_error
