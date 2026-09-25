@@ -31,7 +31,10 @@ module RocotoActor
         end
 
         @queue << Request.new(source, request, release_response)
-        start_worker_locked
+        unless start_worker_locked || @workers.any?(&:alive?)
+          @queue.pop
+          return ResourceLimitError.new("the broker cannot start a thread to serve the request")
+        end
         @condition.signal
         nil
       end
@@ -46,7 +49,10 @@ module RocotoActor
         return false if @stopped
 
         @queue << block
-        start_worker_locked
+        unless start_worker_locked || @workers.any?(&:alive?)
+          @queue.pop
+          return false
+        end
         @condition.signal
         true
       end
@@ -66,13 +72,20 @@ module RocotoActor
 
     private
 
+    # Caller holds @mutex. Returns true when a worker was started. A thread
+    # that cannot be created (RLIMIT_NPROC) is reported, never raised into the
+    # caller, which may be a reaper thread or an application calling stop.
     def start_worker_locked
-      return unless @idle_workers.zero? && @workers.size < @max_workers
+      return false unless @idle_workers.zero? && @workers.size < @max_workers
 
       worker = Thread.new { run_worker }
       worker.report_on_exception = false
       worker.name = "rocoto-actor-broker-lifecycle" if worker.respond_to?(:name=)
       @workers << worker
+      true
+    rescue ThreadError => error
+      report_error(error, "starting a lifecycle thread")
+      false
     end
 
     def run_worker

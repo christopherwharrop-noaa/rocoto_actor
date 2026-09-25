@@ -11,6 +11,7 @@ module RocotoActor
     DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS = 100
     MAX_TIMERS_PER_ACTOR = 100
     MIN_TIMER_INTERVAL = 0.01
+    DEFAULT_PROCESS_MARGIN = 32
     DEFAULT_ERROR_HANDLER = lambda do |error, context|
       warn "rocoto_actor: #{context}: #{error.class}: #{error.message}"
     end
@@ -28,7 +29,11 @@ module RocotoActor
     def initialize(max_routes: DEFAULT_MAX_ROUTES, max_routes_per_actor: DEFAULT_MAX_ROUTES_PER_ACTOR,
                    route_timeout: DEFAULT_ROUTE_TIMEOUT, max_lifecycle_workers: DEFAULT_MAX_LIFECYCLE_WORKERS,
                    max_pending_lifecycle_requests: DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS,
-                   error_handler: DEFAULT_ERROR_HANDLER, on_event: nil)
+                   error_handler: DEFAULT_ERROR_HANDLER, on_event: nil, process_margin: DEFAULT_PROCESS_MARGIN)
+      unless process_margin.nil? || (process_margin.is_a?(Integer) && process_margin >= 0)
+        raise ArgumentError, "process_margin must be a non-negative integer or nil"
+      end
+
       raise ArgumentError, "on_event must respond to call" unless on_event.nil? || on_event.respond_to?(:call)
 
       raise ArgumentError, "error_handler must respond to call" unless error_handler.respond_to?(:call)
@@ -48,6 +53,7 @@ module RocotoActor
       @max_pending_lifecycle_requests = max_pending_lifecycle_requests
       @error_handler = error_handler
       @on_event = on_event
+      @process_margin = process_margin
       @waiting = {} # node id => id of the node it is blocked on (a call or a child's boot)
       @mutex = Mutex.new
       @capacity_condition = ConditionVariable.new
@@ -95,6 +101,7 @@ module RocotoActor
           routes_in_flight: @routes,
           timers: @nodes.values.sum { |node| node.timers.size },
           lifecycle_queue: @lifecycle_executor.pending_requests,
+          process_limit: @process_margin && ProcessBudget.snapshot(@process_margin),
           actors: @nodes.values.map { |node| describe_node(node) }
         }
       end
@@ -425,7 +432,7 @@ module RocotoActor
     def launch_node(actor_class, arguments, parent_id:, name:, options:)
       name = validate_name(name)
       id = SecureRandom.hex(16)
-      reference, boot = Launcher.launch(actor_class, *arguments, context: { actor_id: id }, **options.launch)
+      reference, boot = launch_process(actor_class, arguments, id, options.launch)
       spec = { actor_class: actor_class, arguments: arguments, options: options.launch,
                start_timeout: options.start_timeout }
       node = register(id, reference, parent_id, name, spec, options.policy)
@@ -781,8 +788,7 @@ module RocotoActor
       spec = @mutex.synchronize { node.state == :restarting ? node.spec : nil }
       return unless spec
 
-      reference, boot = Launcher.launch(spec[:actor_class], *spec[:arguments], context: { actor_id: node.id },
-                                                                               **spec[:options])
+      reference, boot = launch_process(spec[:actor_class], spec[:arguments], node.id, spec[:options])
       installed = @mutex.synchronize do
         next false unless node.state == :restarting
 
@@ -798,8 +804,16 @@ module RocotoActor
       reference.attach_broker(self)
       reference.on_exit { actor_exited(node, reference) }
       await_boot(node, boot, spec[:start_timeout]) { |_error| nil }
-    rescue StandardError
+    rescue StandardError => error
+      report_error(error, "relaunch of #{node.path}")
       actor_failed(node)
+    end
+
+    # Every actor process starts here. Refuses, before paying for a process,
+    # when the user's process limit leaves no room for one more actor.
+    def launch_process(actor_class, arguments, actor_id, launch_options)
+      ProcessBudget.check!(@process_margin) if @process_margin
+      Launcher.launch(actor_class, *arguments, context: { actor_id: actor_id }, **launch_options)
     end
 
     def acquire_response_slot(source)

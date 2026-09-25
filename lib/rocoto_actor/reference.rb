@@ -382,6 +382,10 @@ module RocotoActor
         end
         @reaper.name = "rocoto-actor-reaper-#{@pid}" if @reaper.respond_to?(:name=)
       end
+    rescue ThreadError
+      # No thread to reap with (RLIMIT_NPROC): the exit goes unobserved until a
+      # later stop retries here; wait_for_exit then reports false at its deadline.
+      nil
     end
 
     # Runs once on the reaper thread after the watchdog process is reaped.

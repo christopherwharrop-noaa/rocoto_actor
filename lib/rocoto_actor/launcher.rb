@@ -93,6 +93,10 @@ module RocotoActor
       rescue Errno::ECHILD
         nil
       end
+    rescue ThreadError
+      Process.waitpid(pid, Process::WNOHANG) # best effort without a thread to reap with
+    rescue Errno::ECHILD
+      nil
     end
 
     def signal_process_group(pid, signal)

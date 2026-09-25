@@ -43,7 +43,7 @@ Primary implementation files:
 
 - `SIGTERM` and `SIGKILL` do not take effect while a process remains in `D` state. The parent application must nevertheless stay responsive and `stop` must return `false` once its deadline and the kill-confirmation grace have passed.
 - A subprocess can escape process-group containment by deliberately creating a new session or process group (confirmed by probe P5).
-- Ruby itself can wedge under `RLIMIT_NPROC`: when thread creation fails at the limit, the VM sometimes blocks in a futex and ignores `TERM`; only `KILL` removes it. Observed twice while writing the fault matrix and not reproduced on the recorded run, where spawn failed cleanly with `ThreadError`. The library cannot recover a wedged VM; deployments must keep process limits above need (for example a cgroup `pids.max` with headroom) and rely on `KILL`.
+- Ruby itself can wedge under `RLIMIT_NPROC`: when thread creation fails at the limit, the VM sometimes blocks in a futex and ignores `TERM`; only `KILL` removes it. Observed twice while writing the fault matrix and not reproduced on the recorded run, where spawn failed cleanly with `ThreadError`. The library cannot recover a wedged VM, so it avoids the limit instead: `ProcessBudget` refuses every launch (application spawn, actor spawn, relaunch) that would leave less than `process_margin` tasks under the soft limit, raising `ResourceLimitError`, and broker threads that cannot be created are reported through `error_handler` rather than raised into a reaper thread or a `stop` caller. On a login node with `ulimit -u 1024`, one actor costs about 7 tasks and an application with three actors about 26.
 - `RLIMIT_NPROC` counts the uid's processes and threads on the whole host, so a container cannot compute a meaningful limit for it; the fault matrix finds one by probing.
 - Actors run with the application's UID, environment, working directory, resource limits, and filesystem/network access.
 - A timed-out future does not cancel work. Late responses are discarded.
@@ -72,7 +72,7 @@ Suite: `110 runs, 412 assertions, 0 failures` with RuboCop clean, on Ruby 3.4.10
 | T3 3,000 fuzzed frames | pass | only `SerializationError`, `Error`, `EOFError`, or a decode; never another exception |
 | T4 parent RSS while filling a 4 MiB mailbox | pass | +4.3 MB, released after stop |
 | T5 `RLIMIT_NOFILE` = 48 | pass | 37 actors, then `Errno::EMFILE` raised cleanly; broker recovered after freeing descriptors |
-| T5 `RLIMIT_NPROC` at probed threshold + 40 | pass (this run) | 30 actors, then `ThreadError` raised cleanly; see accepted limitations for the wedge seen on other runs |
+| T5 `RLIMIT_NPROC` at probed threshold + 40 | pass (this run) | 30 actors, then `ThreadError` raised cleanly during spawn; the probe runs with the preflight disabled and passes on a clean failure during spawn, fails if `stop` raises, and notes a wedge; see accepted limitations |
 | T6 descriptors in worker and watchdog | pass | `/dev/null` ×3, one anonymous socket, Ruby's eventfd and epoll only |
 | D1 `SIGSTOP`ped worker | pass | ask times out terminally, other actors responsive, `stop` confirms the `KILL` |
 | S1 socket | pass | `socketpair`, no filesystem path |
