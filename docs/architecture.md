@@ -85,9 +85,9 @@ A connection has one phase that only moves forward:
 `terminating` (nothing more is written; pending futures are rejected) →
 `exited` (the watchdog process was reaped) → `gone` (the process group is
 confirmed absent). `enter(phase)` performs the shared shutdown work once;
-`force_stop`, `close_and_reap`, and `actor_exited` differ only in whether they
-kill the group and whether they wait for the reader to drain the watchdog's
-exit report.
+`kill`, `close_and_reap`, and `actor_exited` differ only in whether they kill
+the group and whether they wait for the reader to drain the watchdog's exit
+report.
 
 ### `Launcher` and `Runner`
 
@@ -128,19 +128,30 @@ outside its mutex.
   notifications.
 
 These remain separate because service deadlines must not be delayed by
-blocking lifecycle operations or slow event consumers. A thread that cannot be
-created (`RLIMIT_NPROC`) is reported through `error_handler` and the work is
-failed rather than left waiting: a lifecycle request fails with
-`ResourceLimitError`; a boot or brokered call that cannot be given a deadline
-is rejected with `ResourceLimitError`; a timer that cannot be armed is dropped;
-a relaunch that cannot be queued counts as a failure; and children of a failed
-actor are killed without waiting (`kill_subtrees`) instead of being stopped on
-the pool. The scheduler reports "stopped" distinctly from "no thread", so work
-racing `broker.stop` fails with `ActorStoppedError`. Event work stays queued
-until a later emit starts the thread. A `Reference` with no reaper thread
-observes its process's exit by polling in `wait_for_exit`; `alive?` remains a
-pure query. `broker.stop` closes the event queue before retiring actors, so a
-shutdown emits no events.
+blocking lifecycle operations or slow event consumers. The scheduler and event
+threads start with the broker; `ActorBroker.new` raises `ResourceLimitError`
+if they cannot be created. Lifecycle workers and the per-actor reader, writer,
+and reaper threads are created on demand.
+
+There is no degraded mode for a thread that cannot be created later
+(`RLIMIT_NPROC`), because the broker never needs one: its scheduler thread,
+event thread, and first lifecycle worker are created by `ActorBroker.new`,
+which raises `ResourceLimitError` if any cannot be, and that first worker
+lives until `stop`, so internal work that owns actor state (`stop_later`,
+`relaunch`) can always be queued. Further lifecycle workers are optional; one
+that cannot be created only leaves the pool smaller. Every thread is created
+through `Threads.start`, which turns the `ThreadError` into
+`ResourceLimitError` at the creation site, so a `ThreadError` from lock
+misuse elsewhere is never mistaken for one. A new actor's threads failing is
+that launch's problem: `Launcher.launch` raises `ResourceLimitError` to the
+spawner, or to `relaunch`, which counts it as a failure, exactly as the
+preflight's refusal is handled. `broker.stop` closes the event queue before
+retiring actors, so a shutdown emits no events; it also confirms the exit of
+processes a failed boot killed without waiting.
+
+All four broker threads report through `ErrorReporting`: every exception a
+callback raises goes to `error_handler`, and none of them, nor anything the
+handler raises, ends the thread.
 
 ## Lock and callback rules
 
@@ -174,6 +185,8 @@ interleavings that reviews must preserve.
 | Public API | `broker.rb`, `handle.rb`, `context.rb`, `timer.rb`, `future.rb` |
 | Spawn option parsing (shared by application and worker) | `spawn_options.rb` |
 | Process-limit preflight | `process_budget.rb` |
+| Error reporting on broker threads | `error_reporting.rb` |
+| Thread creation | `threads.rb` |
 | Connection and process lifecycle | `reference.rb`, `launcher.rb`, `runner.rb` |
 | Worker-to-broker protocol | `protocol.rb`, `decode_bindings.rb`, `broker_client.rb`, `transport.rb` |
 | Errors | `errors.rb` |

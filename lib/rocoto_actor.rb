@@ -5,6 +5,8 @@ require "rbconfig"
 
 require_relative "rocoto_actor/version"
 require_relative "rocoto_actor/errors"
+require_relative "rocoto_actor/error_reporting"
+require_relative "rocoto_actor/threads"
 require_relative "rocoto_actor/protocol"
 require_relative "rocoto_actor/handle"
 require_relative "rocoto_actor/timer"

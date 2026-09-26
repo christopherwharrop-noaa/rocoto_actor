@@ -606,6 +606,8 @@ class FaultMatrix
     result = JSON.parse(output.lines.last)
     note = if result["failed_at"] == "stop"
              "stop raised; thread exhaustion must never escape from stop"
+           elsif result["error"] == "RocotoActor::ResourceLimitError"
+             "#{result['failed_at']} refused with ResourceLimitError and stop returned"
            elsif result["error"]
              "#{result['failed_at']} failed cleanly"
            else

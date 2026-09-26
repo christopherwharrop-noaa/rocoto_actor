@@ -91,7 +91,7 @@ violations, in particular through callbacks: `on_resolve`, `on_exit`, `on_done`,
 - `Future#value(timeout:)` reaching its expiration on an application thread concurrently with
   the reader fulfilling the same future.
 - The reaper's `@reader.join(1)` in `Reference#actor_exited` when the reader is
-  itself the thread that called `force_stop` → `start_reaper`.
+  itself the thread that called `kill`.
 
 ## Out of scope
 
