@@ -63,6 +63,7 @@ module RocotoActor
     # is already accounted for by the caller) and returned to be killed.
     def boot_failed
       @booting = false
+      @boot_exit = nil
       record_reference(@reference)
       reference = @reference
       @reference = nil
@@ -104,6 +105,7 @@ module RocotoActor
       @reference = reference
       @generation += 1
       @booting = true
+      @boot_exit = nil
       true
     end
 

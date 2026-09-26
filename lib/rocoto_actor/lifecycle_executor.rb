@@ -19,24 +19,29 @@ module RocotoActor
       @mutex = Mutex.new
       @condition = ConditionVariable.new
       @stopped = false
+      @cap_reported = false
     end
 
+    # Starts the first worker, which lives until stop: from then on every job
+    # has a worker to wait for, whether or not more can be created. Raises
+    # ResourceLimitError if it cannot be created.
+    def start
+      @mutex.synchronize { start_worker_locked }
+    end
+
+    # Returns true when the request is queued, :stopped when the executor has
+    # been stopped, or a BrokerBusyError when the queue is full.
     def enqueue_request(source, request, release_response)
       @mutex.synchronize do
-        return ActorStoppedError.new("actor broker is stopped") if @stopped
+        return :stopped if @stopped
 
         waiting = @queue.count { |job| job.is_a?(Request) }
         if waiting >= @max_pending_requests
           return BrokerBusyError.new("actor broker has #{@max_pending_requests} lifecycle requests waiting")
         end
 
-        @queue << Request.new(source, request, release_response)
-        unless start_worker_locked || @workers.any?(&:alive?)
-          @queue.pop
-          return ResourceLimitError.new("the broker cannot start a thread to serve the request")
-        end
-        @condition.signal
-        nil
+        queue_locked(Request.new(source, request, release_response))
+        true
       end
     end
 
@@ -44,20 +49,19 @@ module RocotoActor
       @mutex.synchronize { @queue.count { |job| job.is_a?(Request) } }
     end
 
+    # Returns true when the job will run, or :stopped when the executor has
+    # been stopped.
     def enqueue_job(&block)
       @mutex.synchronize do
-        return false if @stopped
+        return :stopped if @stopped
 
-        @queue << block
-        unless start_worker_locked || @workers.any?(&:alive?)
-          @queue.pop
-          return false
-        end
-        @condition.signal
+        queue_locked(block)
         true
       end
     end
 
+    # Stops accepting work, waits for the workers, and returns the abandoned
+    # requests.
     def stop
       workers, requests = @mutex.synchronize do
         @stopped = true
@@ -66,28 +70,35 @@ module RocotoActor
         @queue = []
         [@workers.dup, queued.grep(Request)]
       end
-      workers.each { |worker| worker.join unless worker == Thread.current } # stop may run on a worker via error_handler
+      workers.each { |worker| worker.join unless worker == Thread.current } # stop may run on a worker
       requests
     end
 
     private
 
-    # Caller holds @mutex. Returns true when a worker was started. A thread
-    # that cannot be created (RLIMIT_NPROC) is reported, never raised into the
-    # caller, which may be a reaper thread or an application calling stop.
-    def start_worker_locked
-      return false unless @idle_workers.zero? && @workers.size < @max_workers
-
-      worker = Thread.new { run_worker }
-      worker.report_on_exception = false
-      worker.name = "rocoto-actor-broker-lifecycle" if worker.respond_to?(:name=)
-      @workers << worker
-      true
-    rescue ThreadError => error
-      report_error(error, "starting a lifecycle thread")
-      false
+    # Caller holds @mutex. Queues the job and adds a worker when none is idle
+    # and the pool has room; a worker that cannot be created (RLIMIT_NPROC)
+    # only leaves the pool smaller, since the first worker always exists. That
+    # is reported once, from a worker, so no callback runs under the lock.
+    def queue_locked(job)
+      @queue << job
+      begin
+        start_worker_locked if @idle_workers.zero? && @workers.size < @max_workers
+      rescue ResourceLimitError => error
+        unless @cap_reported
+          @cap_reported = true
+          @queue.unshift(-> { ErrorReporting.report(@error_handler, error, "starting a lifecycle thread") })
+        end
+      end
+      @condition.signal
     end
 
+    # Caller holds @mutex.
+    def start_worker_locked
+      @workers << Threads.start("broker-lifecycle", quiet: true) { run_worker }
+    end
+
+    # A worker never ends before stop: the broker relies on one existing.
     def run_worker
       loop do
         job = @mutex.synchronize do
@@ -105,19 +116,13 @@ module RocotoActor
             job.call
           end
         rescue Exception => error # rubocop:disable Lint/RescueException
-          report_error(error, "lifecycle job")
+          # Reported and, for a request, answered; nothing ends the worker.
+          ErrorReporting.report(@error_handler, error, "lifecycle job")
           @request_error.call(job.source, job.request, error, job.release_response) if job.is_a?(Request)
-          raise unless error.is_a?(StandardError)
         end
       end
     ensure
       @mutex.synchronize { @workers.delete(Thread.current) }
-    end
-
-    def report_error(error, context)
-      @error_handler.call(error, context)
-    rescue Exception # rubocop:disable Lint/RescueException
-      nil
     end
   end
   private_constant :LifecycleExecutor

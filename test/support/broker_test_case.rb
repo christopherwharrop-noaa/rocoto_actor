@@ -15,8 +15,8 @@ class BrokerTestCase < Minitest::Test
   # True once the process no longer exists or is a zombie awaiting its parent.
   def process_gone?(pid)
     Process.kill(0, pid)
-    File.exist?("/proc/#{pid}/status") && File.read("/proc/#{pid}/status").match?(/^State:\s+Z/)
-  rescue Errno::ESRCH
+    File.read("/proc/#{pid}/status").match?(/^State:\s+Z/)
+  rescue Errno::ESRCH, Errno::ENOENT # ENOENT: reaped between the signal and the read, or no /proc
     true
   rescue Errno::EPERM
     false

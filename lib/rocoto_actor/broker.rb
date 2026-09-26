@@ -26,6 +26,7 @@ module RocotoActor
     # with at most max_pending_lifecycle_requests waiting for one. error_handler
     # receives (error, context) for failures on the broker's own threads, which
     # are reported rather than allowed to kill the thread; it must not raise.
+    # Raises ResourceLimitError when the broker's own threads cannot be created.
     def initialize(max_routes: DEFAULT_MAX_ROUTES, max_routes_per_actor: DEFAULT_MAX_ROUTES_PER_ACTOR,
                    route_timeout: DEFAULT_ROUTE_TIMEOUT, max_lifecycle_workers: DEFAULT_MAX_LIFECYCLE_WORKERS,
                    max_pending_lifecycle_requests: DEFAULT_MAX_PENDING_LIFECYCLE_REQUESTS,
@@ -61,6 +62,9 @@ module RocotoActor
       @routes = 0
       @responses_by_source = Hash.new(0).compare_by_identity
       @stopped = false
+      # References a failed boot killed without waiting: pruned as their exits
+      # are observed; stop confirms any still alive.
+      @killed_references = {}.compare_by_identity
       @scheduler = DeadlineScheduler.new(error_handler: @error_handler)
       @lifecycle_executor = LifecycleExecutor.new(
         max_workers: @max_lifecycle_workers,
@@ -73,6 +77,7 @@ module RocotoActor
       @event_dispatcher = EventDispatcher.new(error_handler: @error_handler) do |*event|
         deliver_event(*event)
       end
+      start_executors
     end
 
     # parent: is a handle owned by this broker; the new actor becomes its logical
@@ -116,6 +121,7 @@ module RocotoActor
     end
 
     def stop(timeout: Reference::DEFAULT_STOP_TIMEOUT, force: false)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       nodes, threads = @mutex.synchronize do
         @stopped = true
         @capacity_condition.broadcast
@@ -124,13 +130,17 @@ module RocotoActor
         [@nodes.values, [scheduler_thread, event_thread].compact]
       end
       abandoned = @lifecycle_executor.stop
-      abandoned.each do |job|
-        respond_error(job.source, job.request[:request_id], ActorStoppedError.new("actor broker is stopped"),
-                      job.release_response)
-      end
+      abandoned.each { |job| respond_error(job.source, job.request[:request_id], stopped_error, job.release_response) }
       stopped = stop_subtrees(nodes, timeout: timeout, force: force)
+      # Processes failed boots killed without waiting, listed by now since the
+      # sweep is done: confirm them gone, with the grace a forced stop allows
+      # a KILL, once for the batch.
+      killed = @mutex.synchronize { @killed_references.keys.tap { @killed_references.clear } }
+      confirm_by = Reference.kill_deadline(deadline)
+      killed.each(&:kill) # idempotent; a settle may have listed one before killing it
+      confirmed = killed.select(&:alive?).map { |reference| reference.wait_for_exit(confirm_by) }.all?
       threads.each { |thread| thread.join unless thread == Thread.current } # stop may be called from error_handler
-      stopped
+      stopped && confirmed
     end
 
     def ask(id, message)
@@ -194,9 +204,7 @@ module RocotoActor
     # Handles of the actor's children that have not stopped or failed.
     def children(id)
       @mutex.synchronize do
-        fetch_node(id).children.map { |child_id| @nodes[child_id] }
-                      .reject(&:terminal?)
-                      .map { |child| ActorHandle.new(child.id, broker: self) }
+        live_children(fetch_node(id)).map { |child| ActorHandle.new(child.id, broker: self) }
       end
     end
 
@@ -285,7 +293,7 @@ module RocotoActor
 
     def deliver_event(node_id, event, detail, watcher_ids, notify_application)
       handle = ActorHandle.new(node_id, broker: self)
-      guarded("on_event") { @on_event&.call(event, handle, detail) } if notify_application
+      ErrorReporting.guard(@error_handler, "on_event") { @on_event&.call(event, handle, detail) } if notify_application
       watcher_ids.each do |watcher_id|
         reference = @mutex.synchronize do
           watcher = @nodes[watcher_id]
@@ -297,7 +305,7 @@ module RocotoActor
           reference.tell(Protocol.request(:actor_event, event: event, actor: handle, reason: detail[:reason],
                                                         generation: detail[:generation]), nil)
         rescue StandardError => error
-          report_error(error, "event to #{watcher_id}")
+          ErrorReporting.report(@error_handler, error, "event to #{watcher_id}")
         end
       end
     end
@@ -333,12 +341,9 @@ module RocotoActor
         node.timers[record.id] = record
         [node, record]
       end
-      armed = enqueue_task(delay: after || every) { fire_timer(node, timer.id) }
-      unless armed == true
+      if (error = failure_for(enqueue_task(delay: after || every) { fire_timer(node, timer.id) }))
         @mutex.synchronize { node.timers.delete(timer.id) }
-        raise ActorStoppedError, "actor broker is stopped" if armed == :stopped
-
-        raise ResourceLimitError, "the broker cannot start a thread to run the timer"
+        raise error
       end
       respond(source, request[:request_id], Timer.new(timer.id), release_response)
     rescue StandardError => error
@@ -360,11 +365,11 @@ module RocotoActor
     # incarnation has ended is no longer in node.timers and does nothing. A
     # tell that fails is reported, except when the actor has just stopped,
     # which its lifecycle event already reports; a recurring timer tries again
-    # next interval either way.
+    # next interval either way, unless the broker has stopped meanwhile.
     def fire_timer(node, id)
       record, reference = @mutex.synchronize do
         record = node.timers[id]
-        next [nil, nil] unless record && node.active?
+        next [nil, nil] unless record && node.active? && node.reference # none while a failed relaunch boot settles
 
         node.timers.delete(id) unless record.every
         [record, node.reference]
@@ -376,17 +381,13 @@ module RocotoActor
       rescue ActorStoppedError
         nil
       rescue StandardError => error
-        report_error(error, "scheduled tell to #{node.id}")
+        ErrorReporting.report(@error_handler, error, "scheduled tell to #{node.id}")
       end
       return unless record.every
 
-      armed = enqueue_task(delay: record.every) { fire_timer(node, id) }
-      return if armed == true
+      return if enqueue_task(delay: record.every) { fire_timer(node, id) } == true
 
-      @mutex.synchronize { node.timers.delete(id) }
-      return if armed == :stopped # the broker is shutting down; nothing to report
-
-      report_error(ResourceLimitError.new("timer #{id} of #{node.path} dropped: no thread to run it"), "timer")
+      @mutex.synchronize { node.timers.delete(id) } # the broker is stopping
     end
 
     def non_negative_number?(value)
@@ -427,9 +428,8 @@ module RocotoActor
         return respond_error(source, request_id, error, release_response)
       end
 
-      case schedule_expiration(future, timeout)
-      when :stopped then future.reject(ActorStoppedError.new("actor broker is stopped"))
-      when false then future.reject(ResourceLimitError.new("the broker cannot start a thread to time the call"))
+      if (error = failure_for(schedule_expiration(future, timeout)))
+        future.reject(error)
       end
       future.on_resolve do |result, error|
         cancel_expiration(future)
@@ -468,9 +468,8 @@ module RocotoActor
     # future resolves, on whichever thread resolves it. The block receives the
     # error to raise or send, or nil on success.
     def await_boot(node, boot, start_timeout)
-      case schedule_expiration(boot, start_timeout)
-      when :stopped then boot.reject(ActorStoppedError.new("actor broker is stopped"))
-      when false then boot.reject(ResourceLimitError.new("the broker cannot start a thread to time the boot"))
+      if (error = failure_for(schedule_expiration(boot, start_timeout)))
+        boot.reject(error)
       end
       boot.on_resolve do |_result, error|
         cancel_expiration(boot)
@@ -484,22 +483,36 @@ module RocotoActor
     # relaunch counts as another failure under the restart policy. Returns the
     # error a spawner should see, or nil.
     def settle(node, error)
-      first_boot, children, exited, reference = @mutex.synchronize do
-        next [nil, [], false, nil] unless node.booting
+      first_boot, children, exited, reference, overtaken = @mutex.synchronize do
+        next [nil, [], false, nil, false] unless node.booting
 
         first_boot = node.first_boot?
+        # A stop that reached a boot that failed is the outcome the spawner
+        # learns. A boot that succeeds while a stop is in flight is left to
+        # that stop: boot_succeeded declines it and the spawner gets its
+        # handle, as when the stop lands a moment later.
+        overtaken = error && (node.state == :stopping || node.terminal?)
         if error
           # Detaching the reference first means the reaper, seeing an exit from
-          # a reference the node no longer holds, leaves this failure to us.
+          # a reference the node no longer holds, leaves this failure to us. A
+          # first boot is unregistered in the same step, so no sweep can find a
+          # node without a reference.
+          exit_observed = node.boot_exit.equal?(node.reference)
           dead = node.boot_failed
-          node.record_failure(error) if error.is_a?(RemoteError) && !first_boot
-          [first_boot, node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?), false, dead]
+          @killed_references[dead] = true if dead && !exit_observed # killed below without waiting
+          children = live_children(node)
+          if first_boot
+            unregister_locked(node)
+          elsif error.is_a?(RemoteError)
+            node.record_failure(error)
+          end
+          [first_boot, children, false, dead, overtaken]
         else
           if node.boot_succeeded(Process.clock_gettime(Process::CLOCK_MONOTONIC)) && !first_boot
             emit(node, :restarted,
                  nil)
           end
-          [first_boot, [], node.boot_exit.equal?(node.reference), nil]
+          [first_boot, [], node.boot_exit&.equal?(node.reference), nil, false]
         end
       end
       # The process died after replying ready but before we settled: the actor
@@ -509,49 +522,73 @@ module RocotoActor
 
       reference&.kill # without waiting: this may be the scheduler thread
       if first_boot
-        unregister(node)
         stop_later(children)
-        Launcher.startup_error(reference, error)
+        overtaken ? node_error_for(node) : Launcher.startup_error(reference, error)
       else
         actor_failed(node)
         nil
       end
     end
 
-    # Removes a node that never finished booting; its id is known only to the
-    # dead process, so no handle can refer to it.
     def unregister(node)
-      @mutex.synchronize do
-        retire(node, :failed)
-        @nodes.delete(node.id)
-        @nodes[node.parent_id]&.children&.delete(node.id)
-      end
+      @mutex.synchronize { unregister_locked(node) }
     end
 
-    # Spawn and stop requests block for up to their timeouts, so they run on a
-    # bounded pool rather than on the requesting actor's reader thread.
-    # Internal jobs are bounded by the number of nodes, not by the request queue.
+    # Caller holds @mutex. Removes a node that never finished booting; its id
+    # is known only to the dead process, so no handle can refer to it. It ends
+    # :stopped when a stop had reached it (that stop would have retired it),
+    # :failed otherwise.
+    def unregister_locked(node)
+      retire(node, node.state == :stopping ? :stopped : :failed) unless node.terminal?
+      @nodes.delete(node.id)
+      @nodes[node.parent_id]&.children&.delete(node.id)
+    end
+
+    # Queues internal blocking work (stops, relaunches) on the lifecycle pool;
+    # such jobs are bounded by the number of nodes, not by the request queue.
+    # Nothing is queued once the broker is stopping: its sweep owns every node
+    # from then on. Runs on reaper and scheduler threads, so it never raises.
     def enqueue_lifecycle_job(&block)
-      @mutex.synchronize do
-        @lifecycle_executor.enqueue_job(&block) unless @stopped
-      end
-    end
-
-    def enqueue_lifecycle(source, request, release_response)
-      rejection = @mutex.synchronize do
-        if @stopped
-          ActorStoppedError.new("actor broker is stopped")
-        else
-          @lifecycle_executor.enqueue_request(source, request, release_response)
-        end
-      end
-      respond_error(source, request[:request_id], rejection, release_response) if rejection
-    end
-
-    def report_error(error, context)
-      @error_handler.call(error, context)
-    rescue Exception # rubocop:disable Lint/RescueException
+      @mutex.synchronize { @lifecycle_executor.enqueue_job(&block) unless @stopped }
       nil
+    end
+
+    # Spawn and stop requests block for up to their timeouts, so they run on
+    # the bounded pool rather than on the requesting actor's reader thread.
+    def enqueue_lifecycle(source, request, release_response)
+      result = @mutex.synchronize do
+        @stopped ? :stopped : @lifecycle_executor.enqueue_request(source, request, release_response)
+      end
+      return if result == true
+
+      respond_error(source, request[:request_id], failure_for(result) || result, release_response)
+    end
+
+    # Starts the scheduler and event threads and the first lifecycle worker.
+    # Without them the broker cannot run, and a lifecycle worker that exists
+    # from the start means internal work (stopping a failed actor's children,
+    # a relaunch) can always be queued; so a thread that cannot be created
+    # fails construction, and nothing later needs a thread the broker may not
+    # get.
+    def start_executors
+      @scheduler.start
+      @event_dispatcher.start
+      @lifecycle_executor.start
+    rescue ResourceLimitError
+      @scheduler.stop
+      @event_dispatcher.stop
+      @lifecycle_executor.stop
+      raise
+    end
+
+    # An executor's answer as the error to fail the work with, or nil when
+    # the work was taken: a stopped executor means the broker is stopping.
+    def failure_for(result)
+      result == :stopped ? stopped_error : nil
+    end
+
+    def stopped_error
+      ActorStoppedError.new("actor broker is stopped")
     end
 
     def perform_lifecycle(source, request, release_response)
@@ -642,7 +679,7 @@ module RocotoActor
 
     # Caller holds @mutex. Returns the parent node, or nil for a root.
     def check_placement(parent_id, name)
-      raise ActorStoppedError, "actor broker is stopped" if @stopped
+      raise stopped_error if @stopped
 
       parent = nil
       if parent_id
@@ -709,6 +746,11 @@ module RocotoActor
       node
     end
 
+    def node_error_for(node)
+      @mutex.synchronize { node_error(node) }
+    end
+
+    # Caller holds @mutex. Why a node cannot take a message now, or nil.
     def node_error(node)
       return Error.new("unknown actor handle") unless node
 
@@ -720,9 +762,15 @@ module RocotoActor
       end
     end
 
+    # Caller holds @mutex. The node's children that are not terminal. A child
+    # unregistered after its parent was leaves its id behind.
+    def live_children(node)
+      node.children.filter_map { |child_id| @nodes[child_id] }.reject(&:terminal?)
+    end
+
     # Caller holds @mutex. Live descendants first, deepest first, then the node.
     def live_postorder(node)
-      node.children.flat_map { |child_id| live_postorder(@nodes[child_id]) } + (node.terminal? ? [] : [node])
+      live_children(node).flat_map { |child| live_postorder(child) } + (node.terminal? ? [] : [node])
     end
 
     def stop_subtrees(roots, timeout:, force:)
@@ -735,7 +783,9 @@ module RocotoActor
       end
       nodes.map do |node, reference|
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        stopped = reference.stop(timeout: [remaining, 0].max, force: force || remaining <= 0)
+        # A relaunch whose boot just failed has no reference until actor_failed
+        # applies the policy; being stopped first is a valid outcome for it.
+        stopped = reference.nil? || reference.stop(timeout: [remaining, 0].max, force: force || remaining <= 0)
         @mutex.synchronize { retire(node, :stopped) if node.state == :stopping }
         stopped
       end.all?
@@ -745,6 +795,7 @@ module RocotoActor
     # during a boot are settled by the boot future's owner instead.
     def actor_exited(node, reference)
       @mutex.synchronize do
+        @killed_references.delete(reference) # its exit is observed
         return if node.terminal? || !node.reference.equal?(reference)
 
         if node.booting
@@ -769,7 +820,7 @@ module RocotoActor
         # Mark the whole live subtree now so it rejects messages before the
         # service thread gets to it; stop_subtrees re-derives the order itself.
         live_postorder(node).each { |descendant| descendant.begin_stopping unless descendant.equal?(node) }
-        live = node.children.map { |child_id| @nodes[child_id] }.reject(&:terminal?)
+        live = live_children(node)
         delay = restart_delay(node)
         release_incarnation(node)
         if delay
@@ -783,38 +834,17 @@ module RocotoActor
       stop_later(children)
       return unless delay
 
-      armed = enqueue_task(delay: delay) do
-        actor_failed(node) unless enqueue_lifecycle_job { relaunch(node) } # no thread for it: count as a failure
-      end
-      return if armed != false # armed, or the broker is stopping and its sweep will retire the node
-
-      # No thread to even wait on: the restart policy cannot proceed. A stop
-      # that raced in owns the node from here.
-      @mutex.synchronize { retire(node, :failed) if node.state == :restarting }
+      # :stopped only when the broker is stopping, and then its sweep has retired the node.
+      enqueue_task(delay: delay) { enqueue_lifecycle_job { relaunch(node) } }
+      nil
     end
 
     # Force-stops nodes on the lifecycle pool: stopping waits on processes, and
     # the scheduler thread must stay free to run route expirations on time.
     def stop_later(nodes)
       return if nodes.empty?
-      return if enqueue_lifecycle_job { stop_subtrees(nodes, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) }
 
-      kill_subtrees(nodes)
-    end
-
-    # No lifecycle thread available: kill the subtrees without waiting, so the
-    # calling thread (a reaper or the scheduler) is not blocked on process
-    # exits, and retire the nodes; their reapers observe the exits later.
-    def kill_subtrees(roots)
-      references = @mutex.synchronize do
-        roots.flat_map { |root| live_postorder(root) }.uniq.map do |node|
-          node.begin_stopping
-          reference = node.reference
-          retire(node, :stopped)
-          reference
-        end
-      end
-      references.compact.each(&:kill)
+      enqueue_lifecycle_job { stop_subtrees(nodes, timeout: Reference::DEFAULT_STOP_TIMEOUT, force: true) }
     end
 
     # Caller holds @mutex. Records a restart attempt and returns its backoff
@@ -854,13 +884,16 @@ module RocotoActor
       reference.attach_broker(self)
       reference.on_exit { actor_exited(node, reference) }
       await_boot(node, boot, spec[:start_timeout]) { |_error| nil }
-    rescue StandardError => error
-      report_error(error, "relaunch of #{node.path}")
+    rescue Exception => error # rubocop:disable Lint/RescueException -- the node must not be left half-relaunched
+      ErrorReporting.report(@error_handler, error, "relaunch of #{node.path}")
       actor_failed(node)
     end
 
     # Every actor process starts here. Refuses, before paying for a process,
     # when the user's process limit leaves no room for one more actor.
+    # A connection whose threads cannot be created (the preflight can only
+    # estimate) fails this launch the same way, with ResourceLimitError; the
+    # actors already running keep their threads.
     def launch_process(actor_class, arguments, actor_id, launch_options)
       ProcessBudget.check!(@process_margin) if @process_margin
       Launcher.launch(actor_class, *arguments, context: { actor_id: actor_id }, **launch_options)
@@ -894,7 +927,7 @@ module RocotoActor
 
     def acquire_route(source, handle_id)
       @mutex.synchronize do
-        next [nil, nil, ActorStoppedError.new("actor broker is stopped")] if @stopped
+        next [nil, nil, stopped_error] if @stopped
 
         node = @nodes[handle_id]
         error = node_error(node)
@@ -970,12 +1003,6 @@ module RocotoActor
 
     def enqueue_task(delay: 0, &)
       @scheduler.enqueue(delay: delay, &)
-    end
-
-    def guarded(context)
-      yield
-    rescue StandardError => error
-      report_error(error, context)
     end
   end
 end

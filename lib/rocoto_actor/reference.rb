@@ -86,11 +86,15 @@ module RocotoActor
       @exit_status = nil
       @exit_callbacks = []
       @decode_bindings = DecodeBindings.new
-      start_reaper
-      @reader = Thread.new { read_replies }
-      @reader.name = "rocoto-actor-reader-#{pid}" if @reader.respond_to?(:name=)
-      @writer = Thread.new { write_requests }
-      @writer.name = "rocoto-actor-writer-#{pid}" if @writer.respond_to?(:name=)
+      @reader = Threads.start("reader-#{pid}") { read_replies }
+      @writer = Threads.start("writer-#{pid}") { write_requests }
+      start_reaper # last, so a half-built reference never leaves a thread that owns the process
+    rescue ResourceLimitError
+      # Half-built: the launcher reaps the process. Killing here means a
+      # started reader's ensure has nothing left to signal, whenever it ends.
+      kill
+      [@reader, @writer].compact.each { |thread| thread.kill.join(1) }
+      raise
     end
 
     def attach_broker(broker)
@@ -146,10 +150,7 @@ module RocotoActor
 
     def stop(timeout: DEFAULT_STOP_TIMEOUT, force: false)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      if force
-        force_stop
-        return wait_for_exit(kill_deadline(deadline))
-      end
+      return kill_and_confirm(deadline) if force
 
       shutdown = @pending_mutex.synchronize do
         next unless @phase == :open
@@ -175,12 +176,10 @@ module RocotoActor
       close_and_reap
       wait_for_exit(deadline)
     rescue ActorStoppedError, AskTimeoutError, IOError, SystemCallError
-      force_stop
-      wait_for_exit(kill_deadline(deadline))
+      kill_and_confirm(deadline)
     end
 
-    # A query only. Without a reaper thread (RLIMIT_NPROC), an exit is observed
-    # at the next stop or wait rather than here.
+    # A query only; the reaper thread observes the exit.
     def alive?
       @pending_mutex.synchronize do
         return false if reached?(:gone)
@@ -193,9 +192,41 @@ module RocotoActor
       end
     end
 
-    # Kills the process group without waiting for it to be gone. Idempotent.
+    # How long a KILL is given to take effect once deadline has passed.
+    def self.kill_deadline(deadline)
+      [deadline, Process.clock_gettime(Process::CLOCK_MONOTONIC) + KILL_CONFIRMATION_GRACE].max
+    end
+
+    # Kills the process group now, without waiting for it to be gone, and
+    # rejects pending requests as stopped. Idempotent.
     def kill
-      force_stop
+      pending = enter(:terminating)
+      return unless pending
+
+      close_socket
+      Launcher.signal_process_group(@pid, "KILL")
+      pending.each { |future| future.reject(ActorStoppedError.new("actor stopped")) }
+      nil
+    end
+
+    # True once the process group is gone, waiting until deadline for the
+    # exit; a process that is not gone by then leaves the reference as is.
+    def wait_for_exit(deadline)
+      @pending_mutex.synchronize do
+        until reached?(:exited)
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          return false if remaining <= 0
+
+          @exit_condition.wait(@pending_mutex, remaining)
+        end
+      end
+      while Launcher.process_group_alive?(@pid)
+        return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        sleep 0.01
+      end
+      @pending_mutex.synchronize { @phase = :gone }
+      true
     end
 
     private
@@ -255,17 +286,9 @@ module RocotoActor
       nil
     end
 
-    # Kills the process group now. Idempotent; always ensures a reaper exists.
-    def force_stop
-      pending = enter(:terminating)
-      if pending
-        pending.each { |future| future.reject(ActorStoppedError.new("actor stopped")) }
-        close_socket
-        Launcher.signal_process_group(@pid, "KILL")
-      end
-      nil
-    ensure
-      start_reaper
+    def kill_and_confirm(deadline)
+      kill
+      wait_for_exit(Reference.kill_deadline(deadline))
     end
 
     def write_requests
@@ -299,7 +322,7 @@ module RocotoActor
       end
     rescue IOError, SystemCallError => error
       fail_pending(ActorStoppedError.new(error.message))
-      force_stop
+      kill
     ensure
       discard_control_outbox
     end
@@ -355,7 +378,7 @@ module RocotoActor
       end
       fail_pending(ActorStoppedError.new("actor sent a malformed reply: #{error.message}"))
     ensure
-      force_stop
+      kill
     end
 
     def remove_pending(id)
@@ -376,8 +399,6 @@ module RocotoActor
     def close_and_reap
       enter(:terminating)&.each { |future| future.reject(ActorStoppedError.new("actor stopped")) }
       close_socket
-    ensure
-      start_reaper
     end
 
     def wait_for_mailbox_space(deadline, payload_bytes)
@@ -401,32 +422,13 @@ module RocotoActor
       @reaper_mutex.synchronize do
         return if @reaper || !@pid
 
-        @reaper = Thread.new do
+        @reaper = Threads.start("reaper-#{@pid}") do
           Process.waitpid(@pid)
           actor_exited
         rescue Errno::ECHILD
           actor_exited
         end
-        @reaper.name = "rocoto-actor-reaper-#{@pid}" if @reaper.respond_to?(:name=)
       end
-    rescue ThreadError
-      # No thread to reap with (RLIMIT_NPROC): the next alive?, stop, or exit
-      # path retries here, and reap_without_reaper polls in the meantime.
-      nil
-    end
-
-    # With no reaper thread the exit must be observed by whoever waits for it:
-    # poll waitpid instead of the exit condition so a killed process is reaped
-    # (releasing its process slot) and its exit is delivered to the broker.
-    def reaper?
-      start_reaper
-      @reaper_mutex.synchronize { !@reaper.nil? }
-    end
-
-    def reap_now
-      actor_exited if Process.waitpid(@pid, Process::WNOHANG)
-    rescue Errno::ECHILD
-      actor_exited
     end
 
     # Runs once on the reaper thread after the watchdog process is reaped.
@@ -444,10 +446,6 @@ module RocotoActor
       @pending_mutex.synchronize { @exit_callbacks }.each(&:call)
     end
 
-    def kill_deadline(deadline)
-      [deadline, Process.clock_gettime(Process::CLOCK_MONOTONIC) + KILL_CONFIRMATION_GRACE].max
-    end
-
     # Join re-raises whatever ended the reader; nothing here may propagate.
     def join_reader
       return if Thread.current == @reader
@@ -455,35 +453,6 @@ module RocotoActor
       @reader&.join(1)
     rescue Exception # rubocop:disable Lint/RescueException
       nil
-    end
-
-    def wait_for_exit(deadline)
-      polling = !reaper?
-      @pending_mutex.synchronize do
-        until reached?(:exited)
-          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          return false if remaining <= 0
-
-          if polling
-            @pending_mutex.unlock
-            begin
-              reap_now
-              sleep 0.01
-            ensure
-              @pending_mutex.lock
-            end
-          else
-            @exit_condition.wait(@pending_mutex, remaining)
-          end
-        end
-      end
-      while Launcher.process_group_alive?(@pid)
-        return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-
-        sleep 0.01
-      end
-      @pending_mutex.synchronize { @phase = :gone }
-      true
     end
   end
   private_constant :Reference

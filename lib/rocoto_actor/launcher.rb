@@ -90,12 +90,12 @@ module RocotoActor
 
     def terminate_process_group(pid)
       signal_process_group(pid, "KILL")
-      Thread.new do
+      Threads.start("reaper-#{pid}") do
         Process.waitpid(pid)
       rescue Errno::ECHILD
         nil
       end
-    rescue ThreadError
+    rescue ResourceLimitError
       reap_without_thread(pid)
     end
 
